@@ -1,0 +1,24 @@
+{
+    "defaultLandingPath": "/login/",
+    "countries": [
+        {
+            "code": "ZW",
+            "name": "Zimbabwe",
+            "flag": "assets/flags/zw.png",
+            "webeditorUrl": "https://webeditor.zw.example.org",
+            "apiKey": "nta_REPLACE_WITH_KEY_FROM_REPORTING_CONFIGURATIONS_PAGE",
+            "allowedHosts": []
+        },
+        {
+            "code": "MW",
+            "name": "Malawi",
+            "flag": "assets/flags/mw.png",
+            "webeditorUrl": "https://webeditor.mw.example.org",
+            "apiKey": "nta_REPLACE_WITH_KEY_FROM_REPORTING_CONFIGURATIONS_PAGE",
+            "landingPath": "/login/",
+            "allowedHosts": [
+                "*.mw.example.org"
+            ]
+        }
+    ]
+}
