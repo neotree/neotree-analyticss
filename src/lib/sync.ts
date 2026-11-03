@@ -27,7 +27,7 @@ export async function resolveConfig(
     opts: { allowInsecure: boolean; },
 ): Promise<{ config: RemoteConfig; fetched: boolean; verified: boolean; warning?: string; }> {
     const cached = local && validateRemoteConfig(local, country, opts);
-    const cachedConfig = cached?.ok ? cached.value : null;
+    const cachedConfig = cached?.ok && local?.webeditorUrl === country.webeditorUrl ? cached.value : null;
 
     try {
         const version = validateVersion(((await api.fetchVersion(country)) as any)?.versionNumber);

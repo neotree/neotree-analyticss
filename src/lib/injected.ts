@@ -45,6 +45,7 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
       var LOGIN_VIEWPORT = 'width=device-width, initial-scale=1, user-scalable=no';
       var APP_VIEWPORT = 'width=${APP_VIEWPORT_WIDTH}, user-scalable=yes, maximum-scale=5';
       var LOGIN_CSS = ${JSON.stringify(LOGIN_CSS)};
+      var observedPath = location.pathname, loginActive = false;
       var onLoginPage = function () {
         var p = location.pathname.replace(/\\/+$/, '').toLowerCase() || '/';
         if (p === ${landing} || /\\/login$/.test(p)) return true;
@@ -52,6 +53,8 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
       };
       var decorate = function () {
         var login = onLoginPage();
+        observedPath = location.pathname;
+        loginActive = login;
         var VIEWPORT = login ? LOGIN_VIEWPORT : APP_VIEWPORT;
         var viewport = document.querySelector('meta[name="viewport"]');
         if (!viewport) {
@@ -84,7 +87,13 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
       decorate();
       if (typeof MutationObserver !== 'undefined' && document.documentElement && document.documentElement.nodeType) {
         var decorateQueued = false;
-        new MutationObserver(function () {
+        new MutationObserver(function (changes) {
+          // Dashboards change their DOM often. Recheck only when navigation or the viewport meta changes;
+          // login pages still need to watch for the form and brand row appearing after initial load.
+          if (!loginActive && location.pathname === observedPath && !changes.some(function (change) {
+            return change.target && (change.target.nodeName === 'HEAD'
+              || (change.target.nodeName === 'META' && change.target.name === 'viewport'));
+          })) return;
           if (decorateQueued) return;
           decorateQueued = true;
           window.requestAnimationFrame(function () { decorateQueued = false; decorate(); });

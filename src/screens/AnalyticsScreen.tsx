@@ -28,7 +28,7 @@ type Props = {
 
 export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry, onLock }: Props) {
     const t = useTheme();
-    const { state, retry, recheck } = useConfigSync(country, store, allowInsecure);
+    const { state, retry, refresh, recheck } = useConfigSync(country, store, allowInsecure);
     const webViewRef = useRef<WebViewHandle>(null);
     const canGoBack = useRef(false);
     const loadingUrl = useRef<string | null>(null);
@@ -141,7 +141,7 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                         {state.usingSavedConfig ? 'Webeditor unavailable; using saved settings. Superset may still be accessible. ' : 'Configuration check failed: '}
                         {state.verifyError}
                     </Text>
-                    <Pressable accessibilityRole="button" onPress={recheck} hitSlop={12}>
+                    <Pressable accessibilityRole="button" onPress={refresh} hitSlop={12}>
                         <Text style={styles.bannerAction}>Retry</Text>
                     </Pressable>
                 </View>

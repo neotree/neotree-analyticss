@@ -12,6 +12,7 @@ export type SyncState =
     | { status: 'ready'; config: RemoteConfig; verifyError?: string; usingSavedConfig?: boolean; };
 
 const api = createRemoteApi();
+const FOREGROUND_RECHECK_INTERVAL_MS = 60_000;
 
 /**
  * Keeps one country's cached config in step with its Webeditor.
@@ -22,6 +23,7 @@ export function useConfigSync(country: Country, store: ConfigStore, allowInsecur
     const [state, setState] = useState<SyncState>({ status: 'loading' });
     const inFlight = useRef<Promise<void> | null>(null);
     const mounted = useRef(true);
+    const lastVerifiedAt = useRef<number | null>(null);
 
     const run = useCallback((background: boolean) => {
         if (inFlight.current) return inFlight.current;
@@ -31,8 +33,9 @@ export function useConfigSync(country: Country, store: ConfigStore, allowInsecur
 
             try {
                 const local = await store.getConfig(country.code);
+                if (lastVerifiedAt.current === null) lastVerifiedAt.current = local?.lastCheckedAt ?? null;
                 const cached = local && validateRemoteConfig(local, country, { allowInsecure });
-                if (!background && cached?.ok && mounted.current) {
+                if (!background && cached?.ok && local?.webeditorUrl === country.webeditorUrl && mounted.current) {
                     setState({ status: 'ready', config: cached.value });
                 }
 
@@ -40,8 +43,9 @@ export function useConfigSync(country: Country, store: ConfigStore, allowInsecur
                 const now = Date.now();
 
                 if (verified) {
-                    if (fetched) await store.saveConfig(country.code, config, now);
+                    if (fetched) await store.saveConfig(country.code, config, now, country.webeditorUrl);
                     else await store.touchChecked(country.code, now);
+                    lastVerifiedAt.current = now;
                 }
 
                 if (!mounted.current) return;
@@ -79,7 +83,12 @@ export function useConfigSync(country: Country, store: ConfigStore, allowInsecur
     }, [run]);
 
     const retry = useCallback(() => run(false), [run]);
-    const recheck = useCallback(() => run(true), [run]);
+    const refresh = useCallback(() => run(true), [run]);
+    const recheck = useCallback(() => {
+        const elapsed = lastVerifiedAt.current === null ? Infinity : Date.now() - lastVerifiedAt.current;
+        if (elapsed >= 0 && elapsed < FOREGROUND_RECHECK_INTERVAL_MS) return Promise.resolve();
+        return run(true);
+    }, [run]);
 
-    return { state, retry, recheck };
+    return { state, retry, refresh, recheck };
 }

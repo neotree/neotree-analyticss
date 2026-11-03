@@ -63,6 +63,9 @@ async function main() {
     const nav = (u: string, hosts: string[] = []) => isNavigationAllowed(u, 'https://ss.example.org', hosts, strict);
     assert.equal(nav('https://ss.example.org/superset/welcome'), true);
     assert.equal(nav('https://SS.example.org/x'), true);
+    assert.equal(nav('https://ss.example.org:443/x'), true);
+    assert.equal(nav('https://ss.example.org:8443/x'), false);
+    assert.equal(nav('https://ss.example.org:8443/x', ['ss.example.org']), false);
     assert.equal(nav('about:blank'), true);
     assert.equal(nav('https://evil.org/'), false);
     assert.equal(nav('http://ss.example.org/'), false);
@@ -71,11 +74,12 @@ async function main() {
     assert.equal(nav('file:///etc/passwd'), false);
     assert.equal(nav('https://ss.example.org.evil.org/'), false);
     assert.equal(nav('https://sso.idp.org/', ['sso.idp.org']), true);
+    assert.equal(nav('https://sso.idp.org:8443/', ['sso.idp.org']), false);
     assert.equal(buildLandingUrl('https://ss.example.org/sub/', '/login/'), 'https://ss.example.org/sub/login/');
 
     // --- version sync: cache vs fetch
     let configCalls = 0;
-    const stored: StoredConfig = { ...good, supersetUrl: 'https://ss.example.org', countryCode: 'ZW', lastCheckedAt: 1 };
+    const stored: StoredConfig = { ...good, supersetUrl: 'https://ss.example.org', countryCode: 'ZW', lastCheckedAt: 1, webeditorUrl: country.webeditorUrl };
     const apiWith = (version: unknown, config: unknown = good) => ({
         fetchVersion: async () => ({ versionNumber: version }),
         fetchConfig: async () => { configCalls++; return config; },
@@ -85,6 +89,14 @@ async function main() {
     assert.equal(r.fetched, false);
     assert.equal(r.verified, true);
     assert.equal(configCalls, 0, 'identical version must not trigger a full-config fetch');
+
+    const changedEditor = { ...country, webeditorUrl: 'https://other-we.example.org' };
+    r = await resolveConfig(changedEditor, stored, apiWith(3, { ...good, supersetUrl: 'https://new-ss.example.org/' }), strict);
+    assert.equal(r.fetched, true, 'a changed Webeditor must refetch even when the version matches');
+    assert.equal(r.config.supersetUrl, 'https://new-ss.example.org');
+    await assert.rejects(resolveConfig(changedEditor, stored, { fetchVersion: async () => { throw new SyncError('Webeditor offline', '502', true); }, fetchConfig: async () => good }, strict), /Webeditor offline/, 'a cache from another Webeditor must not be used during a 502');
+    r = await resolveConfig(country, { ...stored, webeditorUrl: null }, apiWith(3), strict);
+    assert.equal(r.fetched, true, 'legacy cache rows without a known Webeditor must be refreshed');
 
     r = await resolveConfig(country, stored, apiWith(4, { ...good, versionNumber: 4, inactivityTimeoutMinutes: 30 }), strict);
     assert.equal(r.fetched, true);

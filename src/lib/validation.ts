@@ -82,5 +82,7 @@ export function isNavigationAllowed(url: string, supersetUrl: string, allowedHos
 
     if (target.protocol !== 'https:' && !(opts.allowInsecure && target.protocol === 'http:')) return false;
 
-    return target.hostname.toLowerCase() === base.hostname.toLowerCase() || hostMatches(target.hostname, allowedHosts);
+    // A different port on the same hostname is a different web origin. Host patterns are limited
+    // to the default HTTPS port; a custom port is accepted only for the exact configured origin.
+    return target.origin === base.origin || (target.protocol === 'https:' && !target.port && hostMatches(target.hostname, allowedHosts));
 }

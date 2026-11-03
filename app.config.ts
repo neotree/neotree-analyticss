@@ -101,6 +101,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
         ],
     },
     plugins: [
+        './plugins/withSecureAndroidReleaseSigning',
         'expo-sqlite',
         [
             'expo-splash-screen',
@@ -128,8 +129,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     ],
     extra: {
         countryRegistry: withFlags(loadRegistry()),
-        // Temporarily allow screenshots so the current UI can be reviewed.
-        allowScreenCapture: true,
+        // Health analytics must not appear in screenshots or Android recents previews.
+        allowScreenCapture: false,
         ...(process.env.EAS_PROJECT_ID ? { eas: { projectId: process.env.EAS_PROJECT_ID } } : {}),
     },
 });

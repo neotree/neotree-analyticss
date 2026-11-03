@@ -20,8 +20,8 @@ own loading skeletons take over; the app never waits for charts. Submitting a fo
 The app applies a phone-width viewport to the login page only (detected by path or the sign-in form). Authenticated pages use a 768px desktop layout (the narrowest width at which Superset keeps its horizontal menu) fitted to the phone on load. Users can then pinch zoom and pan horizontally or vertically. On phones, the filter action bar (Apply/Clear) stays pinned to the bottom.
 `scalesPageToFit` stays on so Android respects the viewport setting. Pinch zoom is enabled on signed-in pages (up to 5x; double-tap zoom is off) and disabled on the login page.
 
-Version checks run on every app start and each return to the foreground, de-duplicated while a check is in flight,
-never per render. Failed checks do not update the saved last-checked time.
+Version checks run on every app start and at most once per minute when the app returns to the foreground,
+de-duplicated while a check is in flight. The visible Retry button always checks immediately. Failed checks do not update the saved last-checked time.
 
 Presentation lives in `src/lib/webStyles.ts` (login form and signed-in polish, injected into Superset's pages) and the
 native top bar / loading cover in `AnalyticsScreen.tsx`. It restyles only; it never moves, hides or reorders Superset content.
@@ -32,9 +32,33 @@ native top bar / loading cover in `AnalyticsScreen.tsx`. It restyles only; it ne
 npm install
 cp config/countries.example.json config/countries.local.json   # gitignored; edit it
 npm start            # Expo dev server
+npm run android      # build, install over USB, and open the Android app
 npm test             # unit tests (registry, validation, sync, allowlist, injected script)
 npm run typecheck
 ```
+
+`npm run android` needs one authorized USB device. It builds for that device's CPU and uses ADB's
+nonstreaming install mode, which works around phones that reject Expo's default streamed install.
+After the first native build, use `npm start` for JavaScript-only changes.
+
+If an Android run still prints `› Installing ... CommandError: adb: failed to install`, check the first
+lines of its output. This project's current script prints `> node scripts/run-android.js` and
+`Neotree Android runner: building and installing without ADB streaming`. The `› Installing` line
+comes from Expo's separate `run:android` command. Run `npm pkg get scripts.android` in this repo
+to confirm which script your terminal is using.
+
+No `.env` is required for ordinary local development. See `.env.example` for optional registry and EAS settings.
+For a locally signed Android release, copy it to `.env`, fill in and uncomment the four `NEOTREE_RELEASE_*`
+values, then export them before running Gradle:
+
+```bash
+set -a
+. ./.env
+set +a
+```
+
+Gradle reads process environment variables; it does not load `.env` itself. EAS Build uses its own signing
+credentials and country registry secret.
 
 ### Country registry
 
@@ -72,6 +96,11 @@ npm run build:apk          # eas build --platform android --profile preview
 Keep the signing credentials EAS creates; you need them for upgrades. Release builds enable R8 shrinking/obfuscation
 and Hermes bytecode; verify WebView behaviour on a release build before rollout.
 
+For a **local** signed release build, export `NEOTREE_RELEASE_KEYSTORE`, `NEOTREE_RELEASE_STORE_PASSWORD`,
+`NEOTREE_RELEASE_KEY_ALIAS`, and `NEOTREE_RELEASE_KEY_PASSWORD` before running Gradle. Without all four,
+the local release variant is unsigned; it never falls back to the debug key. EAS Build injects its own signing
+credentials. Keep `credentials.json` and keystores out of Git.
+
 ### Internal APK distribution
 
 The `production` profile also builds an APK for distribution outside Google Play. Keep a consistent release signing
@@ -82,7 +111,7 @@ your internal installation instructions and use an organization-managed installa
 ## Security behaviour
 
 - Local DB holds only country, Superset URL, timeout, version, last-checked time. No credentials, cookies, tokens, keys or dashboard data.
-- WebView is limited to HTTPS on the Superset host (+ `allowedHosts`); other navigation is blocked and a banner is shown.
+- WebView is limited to the exact Superset origin and approved HTTPS hosts on their default port; other navigation is blocked and a banner is shown.
   `javascript:`, `intent:`, `file:` and plain `http:` are refused.
 - Android `incognito` WebView: **all cookies, cache, history and saved form data are wiped every time the WebView mounts**,
   so a session never survives a timeout, app restart or country switch. Users sign in to Superset each time they open the app.
@@ -90,7 +119,7 @@ your internal installation instructions and use an organization-managed installa
   immediately; the page reloads only if the URL changes. On timeout the WebView is **unmounted**, not hidden, and a
   best-effort `GET /logout/` is sent.
 - The app is covered whenever it is not in the foreground, and on resume expiry is checked **before** the cover is lifted.
-- Screenshots are currently allowed so the app UI can be reviewed. Re-enable capture protection before handling real health analytics.
+- Screenshots and Android recents previews are blocked before health analytics are shown.
 - Backups disabled; cleartext traffic disabled in release builds; debugging of the WebView disabled.
 
 ## Known limits (please test before rollout)
