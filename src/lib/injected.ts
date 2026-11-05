@@ -3,8 +3,8 @@ import { APP_CSS, LOGIN_CSS } from './webStyles';
 
 const ACTIVITY_THROTTLE_MS = 5000;
 const SETTLE_CAP_MS = 7000;
-// Superset switches its menu to the stacked (mobile) layout at 767px. Use the narrowest desktop
-// viewport and let Android fit it to the screen on load; users can then pinch zoom and pan.
+// Superset switches its menu to the stacked layout below 768px. Phones need at
+// least this much layout width; larger devices can use their own width.
 const APP_VIEWPORT_WIDTH = 768;
 
 function normalisePath(path: string) {
@@ -38,12 +38,139 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
       (document.head || document.documentElement).appendChild(appStyle);
     }
     if (location.origin === ${origin}) {
-      // Login: device width. Everything else: a desktop-width layout that initially fits the phone;
-      // pinch zoom and panning remain available once signed in.
+      // Superset creates PDF/CSV/ZIP blobs and image data URLs in JavaScript.
+      // Android WebView's HTTP download listener never sees those links.
+      if (window.ReactNativeWebView && window.HTMLAnchorElement && !window.__ntExportBridge) {
+        window.__ntExportBridge = true;
+        var exportSequence = 0;
+        var exportAcks = {};
+        var activeBlobUrls = {};
+        var deferredRevokes = {};
+        var preparingExport = null;
+        var originalRevoke = window.URL.revokeObjectURL.bind(window.URL);
+        window.URL.revokeObjectURL = function (url) {
+          if (activeBlobUrls[url]) deferredRevokes[url] = true;
+          else originalRevoke(url);
+        };
+        var exportPost = function (message) {
+          window.ReactNativeWebView.postMessage(JSON.stringify(message));
+        };
+        window.__ntDownloadAck = function (id, sequence, ok, error) {
+          var key = id + ':' + sequence;
+          var pending = exportAcks[key];
+          if (!pending) return;
+          delete exportAcks[key];
+          clearTimeout(pending.timer);
+          if (ok) pending.resolve(); else pending.reject(new Error(error || 'Could not save export'));
+        };
+        var exportSend = function (message) {
+          return new Promise(function (resolve, reject) {
+            message.sequence = ++exportSequence;
+            var key = message.id + ':' + message.sequence;
+            var timer = setTimeout(function () {
+              delete exportAcks[key];
+              reject(new Error('Saving export timed out'));
+            }, 30000);
+            exportAcks[key] = { resolve: resolve, reject: reject, timer: timer };
+            exportPost(message);
+          });
+        };
+        var readExportChunk = function (piece) {
+          return new Promise(function (resolve, reject) {
+            var reader = new FileReader();
+            reader.onload = function () { resolve(String(reader.result).split(',')[1]); };
+            reader.onerror = function () { reject(new Error('Could not read export')); };
+            reader.readAsDataURL(piece);
+          });
+        };
+        var transferExport = async function (href, name) {
+          if (preparingExport) { clearTimeout(preparingExport.timer); preparingExport = null; }
+          var id = 'export_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+          exportPost({ type: 'export-prepare', id: id, name: name });
+          if (href.slice(0, 5) === 'blob:') activeBlobUrls[href] = true;
+          try {
+            var response = await fetch(href);
+            if (!response.ok) throw new Error('Could not read generated file');
+            var blob = await response.blob();
+            if (blob.size > 100 * 1024 * 1024) throw new Error('Export is larger than 100 MB');
+            await exportSend({ type: 'export-start', id: id, name: name, mime: blob.type || 'application/octet-stream', size: blob.size });
+            for (var offset = 0; offset < blob.size; offset += 48 * 1024) {
+              var chunk = await readExportChunk(blob.slice(offset, offset + 48 * 1024));
+              await exportSend({ type: 'export-chunk', id: id, data: chunk, downloaded: Math.min(offset + 48 * 1024, blob.size) });
+            }
+            await exportSend({ type: 'export-finish', id: id });
+          } catch (error) {
+            exportPost({ type: 'export-abort', id: id, name: name, error: String(error && error.message || error) });
+          } finally {
+            delete activeBlobUrls[href];
+            if (deferredRevokes[href]) { delete deferredRevokes[href]; originalRevoke(href); }
+          }
+        };
+        var handleExportLink = function (anchor) {
+          var href = anchor.href;
+          if (!anchor.download || !/^(blob:|data:)/.test(href)) return false;
+          transferExport(href, anchor.download);
+          return true;
+        };
+        var originalAnchorClick = window.HTMLAnchorElement.prototype.click;
+        window.HTMLAnchorElement.prototype.click = function () {
+          if (!handleExportLink(this)) return originalAnchorClick.apply(this, arguments);
+        };
+        document.addEventListener('click', function (event) {
+          var anchor = event.target && event.target.closest && event.target.closest('a[download]');
+          if (anchor && handleExportLink(anchor)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+          }
+        }, true);
+        document.addEventListener('click', function (event) {
+          var item = event.target && event.target.closest && event.target.closest('[role="menuitem"], .ant-dropdown-menu-item');
+          if (!item) return;
+          var label = (item.textContent || '').trim();
+          if (!/^(export (to|as) pdf|download as image|export screenshot.*|export yaml|export as example|export.*csv|download.*csv|export.*excel)$/i.test(label)) return;
+          if (preparingExport) clearTimeout(preparingExport.timer);
+          var id = 'export_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
+          exportPost({ type: 'export-prepare', id: id, name: label });
+          preparingExport = { timer: setTimeout(function () {
+            exportPost({ type: 'export-abort', id: id, name: label, error: 'No file was generated. Please try again.' });
+            preparingExport = null;
+          }, 120000) };
+        }, true);
+      }
+      // Superset reserves a wide column for native filters when they start open.
+      // On phones, start dashboards with Superset's own filter panel collapsed so
+      // charts receive the full dashboard width. Its filter control still opens it.
+      if (Number(window.screen && window.screen.width) < 700 && typeof history !== 'undefined') {
+        var collapseDashboardUrl = function (value) {
+          if (value == null) return value;
+          try {
+            var target = new URL(String(value), location.href);
+            if (target.origin !== ${origin} || !/(^|\\/)superset\\/dashboard\\/[^/]+/.test(target.pathname)
+              || target.searchParams.has('expand_filters')) return value;
+            target.searchParams.set('expand_filters', '0');
+            return target.href;
+          } catch (e) { return value; }
+        };
+        if (typeof history.replaceState === 'function') {
+          var originalReplace = history.replaceState.bind(history);
+          var initialUrl = collapseDashboardUrl(location.href);
+          if (initialUrl !== location.href) originalReplace(history.state, '', initialUrl);
+          history.replaceState = function (state, title, url) {
+            return originalReplace(state, title, collapseDashboardUrl(url));
+          };
+        }
+        if (typeof history.pushState === 'function') {
+          var originalPush = history.pushState.bind(history);
+          history.pushState = function (state, title, url) {
+            return originalPush(state, title, collapseDashboardUrl(url));
+          };
+        }
+      }
+      // The login form uses device width. Signed-in pages use at least 768 CSS pixels
+      // so Superset's navigation and dashboards have room; Android fits that to phones.
       // This script runs before <body> exists, so everything that depends on the page is applied by
       // decorate(), which is idempotent and re-run (throttled) on every DOM change.
       var LOGIN_VIEWPORT = 'width=device-width, initial-scale=1, user-scalable=no';
-      var APP_VIEWPORT = 'width=${APP_VIEWPORT_WIDTH}, user-scalable=yes, maximum-scale=5';
       var LOGIN_CSS = ${JSON.stringify(LOGIN_CSS)};
       var observedPath = location.pathname, loginActive = false;
       var onLoginPage = function () {
@@ -55,6 +182,10 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
         var login = onLoginPage();
         observedPath = location.pathname;
         loginActive = login;
+        var screenWidth = Number(window.screen && window.screen.width);
+        var APP_VIEWPORT = screenWidth >= ${APP_VIEWPORT_WIDTH}
+          ? 'width=device-width, initial-scale=1, user-scalable=yes, maximum-scale=5'
+          : 'width=${APP_VIEWPORT_WIDTH}, user-scalable=yes, maximum-scale=5';
         var VIEWPORT = login ? LOGIN_VIEWPORT : APP_VIEWPORT;
         var viewport = document.querySelector('meta[name="viewport"]');
         if (!viewport) {
@@ -85,6 +216,156 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
         }
       };
       decorate();
+      window.addEventListener('resize', decorate);
+
+      // Superset owns the filter state and Apply action. The phone adds only a
+      // larger entry point and changes where its existing panel is painted.
+      var filterPanel = null;
+      var filterBackdrop = null;
+      var filterMetrics = '';
+      var closePhoneFilters = function () {
+        var collapse = document.querySelector('[data-test="filter-bar__collapse-button"]');
+        if (collapse) collapse.click();
+      };
+      var updateFilterMetrics = function () {
+        if (!filterPanel) return;
+        var visual = window.visualViewport;
+        var screenWidth = Number(window.screen && window.screen.width) || 360;
+        var width = visual ? visual.width : window.innerWidth;
+        var height = visual ? visual.height : window.innerHeight;
+        var left = visual ? visual.offsetLeft : 0;
+        var top = visual ? visual.offsetTop : 0;
+        if (!width || !height) return;
+        var scale = width / screenWidth;
+        var panelWidth = Math.min(screenWidth * 0.92, 420);
+        var values = [left, top, scale, panelWidth, height / scale].join(':');
+        if (values !== filterMetrics) {
+          filterMetrics = values;
+          filterPanel.style.setProperty('--nt-filter-left', left + 'px');
+          filterPanel.style.setProperty('--nt-filter-top', top + 'px');
+          filterPanel.style.setProperty('--nt-filter-scale', String(scale));
+          filterPanel.style.setProperty('--nt-filter-width', panelWidth + 'px');
+          filterPanel.style.setProperty('--nt-filter-height', height / scale + 'px');
+        }
+        if (filterBackdrop) {
+          filterBackdrop.style.left = left + 'px';
+          filterBackdrop.style.top = top + 'px';
+          filterBackdrop.style.width = width + 'px';
+          filterBackdrop.style.height = height + 'px';
+        }
+      };
+      var syncPhoneDashboard = function () {
+        var mobileDashboard = Number(window.screen && window.screen.width) < 700
+          && /(^|\\/)superset\\/dashboard\\/[^/]+/.test(location.pathname);
+        var root = document.documentElement;
+        if (root && root.classList) {
+          if (mobileDashboard) root.classList.add('nt-dashboard-phone');
+          else root.classList.remove('nt-dashboard-phone');
+        }
+        if (!mobileDashboard || !document.body || !document.body.appendChild) {
+          if (filterBackdrop) { filterBackdrop.remove(); filterBackdrop = null; }
+          var oldButton = document.getElementById('nt-open-filters');
+          if (oldButton) oldButton.remove();
+          filterPanel = null;
+          filterMetrics = '';
+          return;
+        }
+        // Header menu is portal-rendered. Keep its reading, sharing and download
+        // actions, but remove dashboard authoring entries on the phone.
+        var authoringLabels = /^(save as|edit properties|embed dashboard|set filter mapping)$/i;
+        var menuItems = document.querySelectorAll('[data-test="header-actions-menu"] [role="menuitem"], [data-test="header-actions-menu"] li');
+        for (var i = 0; i < menuItems.length; i++) {
+          if (authoringLabels.test((menuItems[i].textContent || '').trim())) menuItems[i].style.display = 'none';
+        }
+        var panel = document.querySelector('[data-test="dashboard-filters-panel"]');
+        var header = document.querySelector('[data-test="dashboard-header-container"]');
+        if (!panel || !header) return;
+        var button = document.getElementById('nt-open-filters');
+        if (!button) {
+          var edit = header.querySelector('[data-test="edit-dashboard-button"]');
+          var anchor = edit && edit.parentElement || header.querySelector('.button-container') || header;
+          button = document.createElement('button');
+          button.id = 'nt-open-filters';
+          button.type = 'button';
+          button.setAttribute('aria-controls', 'nt-phone-filter-panel');
+          button.onclick = function () {
+            var bar = document.querySelector('[data-test="filter-bar"]');
+            if (bar && bar.classList.contains('open')) closePhoneFilters();
+            else {
+              var expand = document.querySelector('[data-test="filter-bar__collapsable"]');
+              if (expand) expand.click();
+            }
+          };
+          if (edit && edit.parentElement) edit.parentElement.insertBefore(button, edit);
+          else anchor.appendChild(button);
+        }
+        var visual = window.visualViewport;
+        var screenWidth = Number(window.screen && window.screen.width) || 360;
+        var ratio = ((visual && visual.width) || window.innerWidth || screenWidth) / screenWidth;
+        button.style.fontSize = Math.round(15 * ratio) + 'px';
+        button.style.minHeight = Math.round(38 * ratio) + 'px';
+        button.style.padding = '0 ' + Math.round(13 * ratio) + 'px';
+        var bar = panel.querySelector('[data-test="filter-bar"]');
+        var open = !!bar && bar.classList.contains('open');
+        button.textContent = open ? 'Close filters' : 'Filters';
+        button.setAttribute('aria-expanded', String(open));
+        if (!open) {
+          if (filterBackdrop) { filterBackdrop.remove(); filterBackdrop = null; }
+          filterPanel = null;
+          filterMetrics = '';
+          return;
+        }
+        panel.id = 'nt-phone-filter-panel';
+        filterPanel = panel;
+        if (!filterBackdrop) {
+          filterBackdrop = document.createElement('div');
+          filterBackdrop.id = 'nt-filter-backdrop';
+          filterBackdrop.setAttribute('aria-label', 'Close filters');
+          filterBackdrop.onclick = closePhoneFilters;
+          document.body.appendChild(filterBackdrop);
+        }
+        updateFilterMetrics();
+      };
+      syncPhoneDashboard();
+      if (typeof setInterval === 'function') setInterval(syncPhoneDashboard, 400);
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', updateFilterMetrics);
+        window.visualViewport.addEventListener('scroll', updateFilterMetrics);
+      }
+      window.addEventListener('resize', updateFilterMetrics);
+      if (document.addEventListener) {
+        document.addEventListener('click', function (event) {
+          if (!document.documentElement.classList.contains('nt-dashboard-phone')) return;
+          var headerTarget = event.target && event.target.closest && event.target.closest('[data-test="dashboard-header-container"]');
+          if (headerTarget) {
+            var statusTarget = event.target;
+            while (statusTarget && statusTarget !== headerTarget) {
+              if (/^(published|draft)$/i.test((statusTarget.textContent || '').trim())) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                return;
+              }
+              statusTarget = statusTarget.parentElement;
+            }
+          }
+          var authoring = event.target && event.target.closest && event.target.closest(
+            '[data-test="edit-dashboard-button"], [data-test="dashboard-edit-actions"], button:has([data-test="filterbar-orientation-icon"]), [data-test="header-actions-menu"] [role="menuitem"], [data-test="header-actions-menu"] li'
+          );
+          if (authoring && (authoring.matches('[data-test="edit-dashboard-button"], [data-test="dashboard-edit-actions"], button:has([data-test="filterbar-orientation-icon"])')
+            || /^(save as|edit properties|embed dashboard|set filter mapping)$/i.test((authoring.textContent || '').trim()))) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            return;
+          }
+          var apply = event.target && event.target.closest && event.target.closest('[data-test="filter-bar__apply-button"]');
+          if (filterPanel && apply && !apply.disabled && typeof setTimeout === 'function') {
+            setTimeout(closePhoneFilters, 250);
+          }
+        }, true);
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape' && filterPanel) closePhoneFilters();
+        });
+      }
       if (typeof MutationObserver !== 'undefined' && document.documentElement && document.documentElement.nodeType) {
         var decorateQueued = false;
         new MutationObserver(function (changes) {

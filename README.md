@@ -17,14 +17,16 @@ Every full page load (first load, sign-in, redirects) sits behind the app's bran
 on screen: on the login page that is the form, elsewhere the React shell (menu, skeleton or text). From then on Superset's
 own loading skeletons take over; the app never waits for charts. Submitting a form (e.g. a wrong password) shows
 "Signing in…" at once instead of a blank page. In-app navigation never gets a native cover. Backstops: 10 s after load, 15 s overall.
-The app applies a phone-width viewport to the login page only (detected by path or the sign-in form). Authenticated pages use a 768px desktop layout (the narrowest width at which Superset keeps its horizontal menu) fitted to the phone on load. Users can then pinch zoom and pan horizontally or vertically. On phones, the filter action bar (Apply/Clear) stays pinned to the bottom.
-`scalesPageToFit` stays on so Android respects the viewport setting. Pinch zoom is enabled on signed-in pages (up to 5x; double-tap zoom is off) and disabled on the login page.
+The login page uses the device-width viewport. Signed-in pages use at least 768px of layout width: Android fits that layout to smaller phones, while devices 768px or wider use their own width. The app does not change device orientation. Users can pinch zoom and pan. On phones, Apply/Clear stays at the bottom of the filter overlay.
+`scalesPageToFit` stays on so Android respects the viewport setting. Pinch zoom remains available on signed-in pages. Filter fields use a readable font size to avoid focus zoom, while Apply/Clear stays pinned at the bottom.
+Phone dashboards start with Superset's native filter panel collapsed, giving charts the full dashboard width. A Filters button in the dashboard header opens the native panel as a phone-sized overlay. The dashboard stays visible behind it; Apply/Clear stays reachable when the keyboard opens. Dashboard authoring controls are hidden in this mobile UI.
+Android HTTP downloads show progress in the app and the system notification. Superset-generated PDF, image, CSV, and ZIP files use the WebView export bridge, which saves them to the device's Downloads folder and shows preparation, progress, completion, or failure in the app. The export bridge requires a rebuilt Android app and Android 10 or newer.
 
 Version checks run on every app start and at most once per minute when the app returns to the foreground,
 de-duplicated while a check is in flight. The visible Retry button always checks immediately. Failed checks do not update the saved last-checked time.
 
 Presentation lives in `src/lib/webStyles.ts` (login form and signed-in polish, injected into Superset's pages) and the
-native top bar / loading cover in `AnalyticsScreen.tsx`. It restyles only; it never moves, hides or reorders Superset content.
+native top bar / loading cover in `AnalyticsScreen.tsx`. On phones the app asks Superset to start dashboards with its filter panel collapsed and displays the existing panel as an overlay; Superset still owns filter state and chart layout. The mobile authoring restrictions are presentation controls, not a replacement for server permissions.
 
 ## Setup
 
@@ -39,6 +41,8 @@ npm run typecheck
 
 `npm run android` needs one authorized USB device. It builds for that device's CPU and uses ADB's
 nonstreaming install mode, which works around phones that reject Expo's default streamed install.
+The debug APK loads JavaScript from Metro on port 8081. The runner forwards that port over USB;
+if this project's Metro is already running there, it reuses it. Stop a different server on 8081 before retrying.
 After the first native build, use `npm start` for JavaScript-only changes.
 
 If an Android run still prints `› Installing ... CommandError: adb: failed to install`, check the first
@@ -130,7 +134,12 @@ your internal installation instructions and use an organization-managed installa
   login page and on small screens.
 - Superset's own dashboards and filters may still use desktop-only layouts. `MOBILE_CONSUMPTION_MODE` was merged upstream
   after Superset 6.1.0, so it is not available in 6.1.0. A later server version that includes the feature can enable
-  mobile drawers and dashboard layouts; the app cannot enable that mode from a WebView.
+  mobile drawers and dashboard layouts; the app cannot enable that mode from a WebView. Test these scoped CSS workarounds on each deployed Superset build and on phones and tablets.
+- Superset generates many exports as `blob:` or `data:` links, which Android WebView's HTTP download listener does not receive. The app transfers these exports through its native module to Android Downloads. Files above 100 MB are rejected with a visible error; devices before Android 10 need a different storage path.
+
+### Tester screen recordings
+
+Set `NEOTREE_ALLOW_SCREEN_CAPTURE=true` when building an internal feedback APK to allow screenshots and recordings. Omit it for ordinary builds; health analytics and Android recents previews remain protected. Share recordings only through the approved project channel.
 - The request to a Webeditor with a wrong/rotated key shows "access key rejected"; rotating the key means shipping a new build.
 
 ## Branding

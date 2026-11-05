@@ -129,8 +129,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     ],
     extra: {
         countryRegistry: withFlags(loadRegistry()),
-        // Health analytics must not appear in screenshots or Android recents previews.
-        allowScreenCapture: false,
+        // Internal feedback builds may opt in to screen recording. Keep release builds protected.
+        allowScreenCapture: process.env.NEOTREE_ALLOW_SCREEN_CAPTURE === 'true',
         ...(process.env.EAS_PROJECT_ID ? { eas: { projectId: process.env.EAS_PROJECT_ID } } : {}),
     },
 });

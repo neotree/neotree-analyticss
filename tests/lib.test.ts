@@ -193,7 +193,7 @@ async function main() {
     assert.equal(brandChildren.length, 1);
     assert.equal(brandChildren[0].id, 'nt-login-logo');
     assert.ok(brandChildren[0].src.startsWith('data:image/png;base64,'));
-    assert.ok(!script.includes('.dashboard-content'), 'do not override Superset dashboard layout');
+    assert.ok(!script.includes('.react-grid-layout'), 'do not override Superset chart geometry');
     assert.deepEqual(bodyClasses, ['nt-login']);
     assert.equal(isPageReadyMessage(messages[0], 'https://ss.example.org/login/'), true);
     assert.equal(isPageReadyMessage(messages[0], 'https://ss.example.org/other/'), false);
@@ -204,10 +204,36 @@ async function main() {
     assert.ok(!script.includes('navigation-start'), 'in-app route changes must not trigger a native loading cover');
     const homeNodes: any[] = [];
     const homePage = { ...page, head: { appendChild: (node: any) => homeNodes.push(node) }, documentElement: { appendChild: (node: any) => homeNodes.push(node) } };
-    vm.runInNewContext(script, { document: homePage, location: { origin: 'https://ss.example.org', pathname: '/superset/welcome/', href: 'https://ss.example.org/superset/welcome/' }, window: { ...webWindow, __ntInit: false }, Event: class {} });
+    vm.runInNewContext(script, { document: homePage, location: { origin: 'https://ss.example.org', pathname: '/superset/welcome/', href: 'https://ss.example.org/superset/welcome/' }, window: { ...webWindow, screen: { width: 360 }, __ntInit: false }, Event: class {} });
     assert.ok(homeNodes.some(node => node.id === 'nt-filter-actions-style'));
-    assert.ok(homeNodes.some(node => node.name === 'viewport' && node.content.includes('width=768') && !node.content.includes('initial-scale=1') && node.content.includes('user-scalable=yes')), 'app pages initially fit the screen and remain zoomable');
+    assert.ok(homeNodes.some(node => node.name === 'viewport' && node.content.includes('width=768') && !node.content.includes('initial-scale=1') && node.content.includes('user-scalable=yes')), 'phones fit a 768px layout and remain zoomable');
     assert.ok(!homeNodes.some(node => node.id === 'nt-mobile-style'), 'login-only styles stay off authenticated pages');
+    // The phone dashboard should start with filters collapsed; users can still
+    // reopen them, and an explicit Superset preference must not be overwritten.
+    {
+        const route = 'https://ss.example.org/superset/dashboard/5/';
+        const calls: string[] = [];
+        const history = {
+            state: null,
+            replaceState: (_state: unknown, _title: string, url: string) => { calls.push(url); },
+            pushState: (_state: unknown, _title: string, url: string) => { calls.push(url); },
+        };
+        vm.runInNewContext(script, {
+            document: { ...page, head: { appendChild: () => {} }, documentElement: { appendChild: () => {} } },
+            location: { origin: 'https://ss.example.org', pathname: '/superset/dashboard/5/', href: route },
+            window: { ...webWindow, screen: { width: 360 }, __ntInit: false },
+            history, Event: class {}, URL,
+        });
+        assert.equal(new URL(calls[0]).searchParams.get('expand_filters'), '0');
+        history.pushState(null, '', '/superset/dashboard/6/');
+        assert.equal(new URL(calls[1]).searchParams.get('expand_filters'), '0');
+        history.pushState(null, '', '/superset/dashboard/6/?expand_filters=1');
+        assert.equal(new URL(calls[2], route).searchParams.get('expand_filters'), '1');
+    }
+    const tabletNodes: any[] = [];
+    const tabletPage = { ...page, head: { appendChild: (node: any) => tabletNodes.push(node) }, documentElement: { appendChild: (node: any) => tabletNodes.push(node) } };
+    vm.runInNewContext(script, { document: tabletPage, location: { origin: 'https://ss.example.org', pathname: '/superset/welcome/', href: 'https://ss.example.org/superset/welcome/' }, window: { ...webWindow, screen: { width: 820 }, __ntInit: false }, Event: class {} });
+    assert.ok(tabletNodes.some(node => node.name === 'viewport' && node.content.includes('width=device-width') && node.content.includes('initial-scale=1') && node.content.includes('user-scalable=yes')), 'larger screens use their own width and remain zoomable');
     // dashboards: not ready while the React root is empty (blank page); ready as soon as the shell/skeleton renders
     {
         const timers: (() => void)[] = [];
@@ -239,7 +265,7 @@ async function main() {
     assert.equal(readBusyLabel('{"type":"activity"}'), null);
     assert.equal(readBusyLabel('nope'), null);
 
-    // Wide content does not change the initial desktop viewport or force a zoom level.
+    // Wide content does not change the fitted viewport or force a zoom level.
     {
         const nodes3: any[] = [];
         const wideApp: any = { childElementCount: 1, querySelector: () => null, innerText: 'x', scrollWidth: 900, clientWidth: 768 };
@@ -248,7 +274,7 @@ async function main() {
             location: { origin: 'https://ss.example.org', pathname: '/chart/list/', href: 'https://ss.example.org/chart/list/' },
             window: { ...webWindow, __ntInit: false }, Event: class {}, URL,
         });
-        assert.ok(nodes3.some(n => n.name === 'viewport' && n.content.includes('width=768') && !n.content.includes('initial-scale=')), 'wide content does not force an initial zoom');
+        assert.ok(nodes3.some(n => n.name === 'viewport' && n.content.includes('width=768') && !n.content.includes('initial-scale=')), 'wide content keeps the fitted viewport');
     }
     // login detected even when it is not exactly the landing path (prefix / redirect)
     const prefixNodes: any[] = [];

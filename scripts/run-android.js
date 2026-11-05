@@ -1,5 +1,6 @@
 const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
+const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 
@@ -43,11 +44,15 @@ function portIsFree(port) {
   });
 }
 
-async function availablePort() {
-  for (let port = 8081; port <= 8090; port++) {
-    if (await portIsFree(port)) return port;
-  }
-  throw new Error('No free Metro port from 8081 to 8090. Stop an old Expo server and retry.');
+function existingMetroProject() {
+  return new Promise(resolve => {
+    const request = http.get('http://127.0.0.1:8081/status', response => {
+      response.resume();
+      resolve(response.headers['x-react-native-project-root'] === root);
+    });
+    request.setTimeout(1500, () => { request.destroy(); resolve(false); });
+    request.on('error', () => resolve(false));
+  });
 }
 
 async function main() {
@@ -69,9 +74,20 @@ async function main() {
   console.log('Installing with ADB nonstreaming mode...');
   await run(adb, ['-s', serial, 'install', '--no-streaming', '-r', apk]);
 
-  const port = await availablePort();
-  console.log(`Starting Metro on port ${port} and opening the app...`);
-  await run(expo, ['start', '--dev-client', '--android', '--host', 'localhost', '--port', String(port)]);
+  // The debug APK uses 8081. Choosing another Metro port without rebuilding the
+  // native debug host leaves Android on the splash screen or crashes at launch.
+  if (!await portIsFree(8081)) {
+    if (!await existingMetroProject()) {
+      throw new Error('Port 8081 is occupied by another server. Stop it, then run npm run android again.');
+    }
+    console.log('Reusing this project\'s Metro server on port 8081.');
+    await run(adb, ['-s', serial, 'reverse', 'tcp:8081', 'tcp:8081']);
+    await run(adb, ['-s', serial, 'shell', 'am', 'start', '-n', 'app.neotree.analytics/.MainActivity']);
+    return;
+  }
+  await run(adb, ['-s', serial, 'reverse', 'tcp:8081', 'tcp:8081']);
+  console.log('Starting Metro on port 8081 and opening the app...');
+  await run(expo, ['start', '--dev-client', '--android', '--host', 'localhost', '--port', '8081']);
 }
 
 main().catch(error => {

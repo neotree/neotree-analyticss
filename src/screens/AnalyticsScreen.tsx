@@ -5,8 +5,10 @@ import { WebView, type WebViewMessageEvent, type WebViewNavigation, type WebView
 import type { ShouldStartLoadRequest, WebViewHttpErrorEvent } from 'react-native-webview/lib/WebViewTypes';
 
 import { ErrorView, LoadingCover, LoadingView, PrivacyCover } from '../components/Screens';
+import { Spinner } from '../components/Spinner';
 import { useConfigSync } from '../hooks/useConfigSync';
 import { useInactivity } from '../hooks/useInactivity';
+import { abortExport, canTrackDownloads, downloadStatus, listDownloads, parseExportMessage, saveExportMessage, type AndroidDownload } from '../lib/downloads';
 import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, pageKey, readBusyLabel, readyPageUrl } from '../lib/injected';
 import { bestEffortLogout } from '../lib/logout';
 import type { ConfigStore, Country } from '../lib/types';
@@ -26,6 +28,8 @@ type Props = {
     onLock: () => void;
 };
 
+type ExportProgress = { id: string; name: string; status: 'preparing' | 'saving' | 'complete' | 'failed'; downloaded: number; total: number; error?: string };
+
 export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry, onLock }: Props) {
     const t = useTheme();
     const { state, retry, refresh, recheck } = useConfigSync(country, store, allowInsecure);
@@ -38,6 +42,9 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
     const [readySource, setReadySource] = useState<string | null>(null);
     const [coverLabel, setCoverLabel] = useState('Loading…');
     const [blockedHost, setBlockedHost] = useState<string | null>(null);
+    const [download, setDownload] = useState<AndroidDownload | null>(null);
+    const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+    const seenDownloads = useRef<Set<string> | null>(null);
 
     const config = state.status === 'ready' ? state.config : null;
     const supersetUrl = config?.supersetUrl;
@@ -85,6 +92,41 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         if (revealTimer.current) clearTimeout(revealTimer.current);
     }, []);
 
+    // WebView queues HTTP attachments in Android DownloadManager. Poll this app's
+    // downloads so progress and completion appear in the app as well as Android's notification.
+    useEffect(() => {
+        if (!canTrackDownloads) return;
+        let cancelled = false;
+        let checking = false;
+        const check = async () => {
+            if (checking) return;
+            checking = true;
+            try {
+                const downloads = await listDownloads();
+                if (cancelled) return;
+                if (!seenDownloads.current) {
+                    seenDownloads.current = new Set(downloads.map(item => item.id));
+                    return;
+                }
+                const newest = downloads.filter(item => !seenDownloads.current!.has(item.id))
+                    .sort((a, b) => Number(b.id) - Number(a.id))[0];
+                if (newest) {
+                    seenDownloads.current.add(newest.id);
+                    setDownload(newest);
+                } else {
+                    setDownload(previous => previous && downloads.find(item => item.id === previous.id) || previous);
+                }
+            } catch {
+                // Android's own download notification remains available if status polling fails.
+            } finally {
+                checking = false;
+            }
+        };
+        void check();
+        const timer = setInterval(check, 1000);
+        return () => { cancelled = true; clearInterval(timer); };
+    }, []);
+
     // A stalled page load must never leave an opaque spinner over a usable WebView.
     useEffect(() => {
         if (!supersetUrl || pageReady || pageError) return;
@@ -93,6 +135,37 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
     }, [supersetUrl, pageReady, pageError]);
 
     const onMessage = useCallback((e: WebViewMessageEvent) => {
+        const exportMessage = parseExportMessage(e.nativeEvent.data);
+        if (exportMessage) {
+            if (exportMessage.type === 'export-prepare') {
+                setExportProgress({ id: exportMessage.id, name: exportMessage.name, status: 'preparing', downloaded: 0, total: 0 });
+            } else if (exportMessage.type === 'export-abort') {
+                void abortExport(exportMessage.id);
+                setExportProgress(previous => previous?.id === exportMessage.id
+                    ? { ...previous, status: 'failed', error: exportMessage.error }
+                    : { id: exportMessage.id, name: exportMessage.name, status: 'failed', downloaded: 0, total: 0, error: exportMessage.error });
+            } else {
+                void (async () => {
+                    try {
+                        const result = await saveExportMessage(exportMessage);
+                        setExportProgress(previous => {
+                            if (!previous || previous.id !== exportMessage.id) return previous;
+                            if (exportMessage.type === 'export-start') return { ...previous, name: String(result || previous.name), status: 'saving', total: exportMessage.size };
+                            if (exportMessage.type === 'export-chunk') return { ...previous, downloaded: exportMessage.downloaded };
+                            return { ...previous, name: String(result || previous.name), status: 'complete', downloaded: previous.total };
+                        });
+                        webViewRef.current?.injectJavaScript(`window.__ntDownloadAck(${JSON.stringify(exportMessage.id)},${exportMessage.sequence},true);true;`);
+                    } catch (error) {
+                        void abortExport(exportMessage.id);
+                        setExportProgress(previous => previous?.id === exportMessage.id
+                            ? { ...previous, status: 'failed', error: error instanceof Error ? error.message : 'Could not save export' }
+                            : previous);
+                        webViewRef.current?.injectJavaScript(`window.__ntDownloadAck(${JSON.stringify(exportMessage.id)},${exportMessage.sequence},false,${JSON.stringify(error instanceof Error ? error.message : 'Could not save export')});true;`);
+                    }
+                })();
+            }
+            return;
+        }
         if (isActivityMessage(e.nativeEvent.data)) markActivity();
         const busy = readBusyLabel(e.nativeEvent.data);
         if (busy) {
@@ -153,6 +226,64 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                     <Pressable accessibilityRole="button" onPress={() => setBlockedHost(null)} hitSlop={12}>
                         <Text style={styles.bannerAction}>Dismiss</Text>
                     </Pressable>
+                </View>
+            )}
+
+            {!!download && (
+                <View style={[styles.downloadBanner, { backgroundColor: t.surface, borderColor: t.border }]}>
+                    {downloadStatus(download) === 'active' && <Spinner size={25} />}
+                    <View style={styles.downloadDetails}>
+                        <Text style={[styles.downloadTitle, { color: t.text }]} numberOfLines={1}>
+                            {downloadStatus(download) === 'complete' ? 'Download complete' : downloadStatus(download) === 'failed' ? 'Download failed' : 'Downloading…'}
+                        </Text>
+                        <Text style={[styles.downloadSubtitle, { color: t.muted }]} numberOfLines={2}>
+                            {downloadStatus(download) === 'complete'
+                                ? `Saved to Downloads/${download.name}`
+                                : downloadStatus(download) === 'failed'
+                                    ? download.name
+                                    : download.total > 0
+                                        ? `${download.name} · ${Math.min(100, Math.round(download.downloaded / download.total * 100))}%`
+                                        : `${download.name} · check Android notification for progress`}
+                        </Text>
+                        {downloadStatus(download) === 'active' && download.total > 0 && (
+                            <View style={[styles.downloadTrack, { backgroundColor: t.border }]}>
+                                <View style={[styles.downloadFill, { backgroundColor: t.primary, width: `${Math.min(100, Math.max(0, download.downloaded / download.total * 100))}%` }]} />
+                            </View>
+                        )}
+                    </View>
+                    {downloadStatus(download) !== 'active' && (
+                        <Pressable accessibilityRole="button" onPress={() => setDownload(null)} hitSlop={12}>
+                            <Text style={[styles.downloadDismiss, { color: t.primary }]}>Dismiss</Text>
+                        </Pressable>
+                    )}
+                </View>
+            )}
+
+            {!!exportProgress && (
+                <View style={[styles.downloadBanner, { backgroundColor: t.surface, borderColor: t.border }]}>
+                    {(exportProgress.status === 'preparing' || exportProgress.status === 'saving') && <Spinner size={25} />}
+                    <View style={styles.downloadDetails}>
+                        <Text style={[styles.downloadTitle, { color: t.text }]} numberOfLines={1}>
+                            {exportProgress.status === 'complete' ? 'Export complete' : exportProgress.status === 'failed' ? 'Export failed' : exportProgress.status === 'preparing' ? 'Preparing export…' : 'Saving export…'}
+                        </Text>
+                        <Text style={[styles.downloadSubtitle, { color: t.muted }]} numberOfLines={2}>
+                            {exportProgress.status === 'complete' ? `Saved to Downloads/${exportProgress.name}`
+                                : exportProgress.status === 'failed' ? exportProgress.error || 'Could not save the file'
+                                : exportProgress.status === 'saving' && exportProgress.total > 0
+                                    ? `${exportProgress.name} · ${Math.min(100, Math.round(exportProgress.downloaded / exportProgress.total * 100))}%`
+                                    : exportProgress.name}
+                        </Text>
+                        {exportProgress.status === 'saving' && exportProgress.total > 0 && (
+                            <View style={[styles.downloadTrack, { backgroundColor: t.border }]}>
+                                <View style={[styles.downloadFill, { backgroundColor: t.primary, width: `${Math.min(100, Math.max(0, exportProgress.downloaded / exportProgress.total * 100))}%` }]} />
+                            </View>
+                        )}
+                    </View>
+                    {(exportProgress.status === 'complete' || exportProgress.status === 'failed') && (
+                        <Pressable accessibilityRole="button" onPress={() => setExportProgress(null)} hitSlop={12}>
+                            <Text style={[styles.downloadDismiss, { color: t.primary }]}>Dismiss</Text>
+                        </Pressable>
+                    )}
                 </View>
             )}
 
@@ -219,7 +350,7 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                         mixedContentMode="never"
                         webviewDebuggingEnabled={false}
                         textZoom={100}
-                        // Pinch zoom for signed-in pages (the login page's viewport forbids it). The on-screen +/- buttons stay hidden.
+                        // Allow deliberate pinch zoom; the page CSS keeps small filter fields readable.
                         setBuiltInZoomControls
                         setDisplayZoomControls={false}
                     />
@@ -254,4 +385,11 @@ const styles = StyleSheet.create({
     bannerText: { color: '#FFFFFF', fontSize: 13, flex: 1 },
     bannerAction: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', textDecorationLine: 'underline' },
     webWrap: { flex: 1 },
+    downloadBanner: { borderBottomWidth: 1, paddingHorizontal: 14, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 12 },
+    downloadDetails: { flex: 1 },
+    downloadTitle: { fontSize: 14, fontWeight: '700' },
+    downloadSubtitle: { fontSize: 12, marginTop: 2 },
+    downloadTrack: { height: 4, borderRadius: 2, marginTop: 6, overflow: 'hidden' },
+    downloadFill: { height: 4, borderRadius: 2 },
+    downloadDismiss: { fontSize: 12, fontWeight: '700' },
 });

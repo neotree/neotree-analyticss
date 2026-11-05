@@ -1,8 +1,4 @@
-/**
- * Presentation layer injected into Superset's pages. It only restyles what Superset renders (sizes, spacing,
- * colour, alignment); it never moves, hides or reorders content. Selectors target Superset's stable
- * `data-test` hooks and Ant Design classes, so an unmatched selector is a harmless no-op.
- */
+/** Presentation layer injected into Superset's pages. */
 
 const GREEN = '#2E7D5B';
 const NAVY = '#2B304A';
@@ -60,17 +56,91 @@ export const APP_CSS = `
 html { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
 body { overscroll-behavior-y: none; }
 
-/* Floating Apply / Clear bar: brand colour, comfortable targets, and room below the filters so the last
-   filter is never hidden behind it. */
+/* Small filter fields trigger focus zoom in mobile WebViews. Keep their text at a
+   readable CSS size while leaving the dashboard viewport and pinch zoom alone. */
 @media (max-device-width: 700px) {
-  [data-test="filterbar-action-buttons"] {
-    position: fixed !important; left: 0 !important; bottom: 0 !important;
-    width: 100vw !important; max-width: 100vw !important; box-sizing: border-box !important; z-index: 1000 !important;
-    background: #fff !important; padding: 12px 18px !important; gap: 10px !important;
-    border-top: 1px solid #DCE5E0 !important; box-shadow: 0 -4px 14px rgba(43, 48, 74, .12) !important;
+  html:not(.nt-login) input, html:not(.nt-login) textarea,
+  html:not(.nt-login) select { font-size: 16px !important; }
+}
+
+/* Superset 6.1 places the native filter bar in the first dashboard grid column.
+   On phones, charts span the grid and the open filter bar becomes an overlay. */
+@media (max-device-width: 700px) {
+  html.nt-dashboard-phone [data-test="dashboard-header-wrapper"],
+  html.nt-dashboard-phone *:has(> [data-test="dashboard-content-wrapper"]) {
+    grid-column: 1 / -1 !important;
+    min-width: 0 !important;
   }
-  [data-test="filterbar-action-buttons"] .ant-btn, [data-test="filterbar-action-buttons"] button { min-height: 40px !important; border-radius: 10px !important; }
-  [data-test="filterbar-action-buttons"] .ant-btn-primary { background-color: ${GREEN} !important; border-color: ${GREEN} !important; }
-  [data-test="filterbar-action-buttons"] .ant-btn-primary[disabled] { background-color: #E3EAE6 !important; border-color: #E3EAE6 !important; color: #8B9A93 !important; }
-  *:has(> [data-test="filterbar-action-buttons"]) { padding-bottom: 96px !important; }
+  /* ResizableSidebar renders its resize handle immediately before FiltersPanel.
+     Hide only that handle; their shared parent is the entire dashboard grid. */
+  html.nt-dashboard-phone *:has(+ [data-test="dashboard-filters-panel"]) { display: none !important; }
+  html.nt-dashboard-phone [data-test="dashboard-header-wrapper"] { max-width: 100vw !important; }
+  html.nt-dashboard-phone [data-test="dashboard-filters-panel"] { display: none !important; }
+  html.nt-dashboard-phone [data-test="dashboard-filters-panel"]:has([data-test="filter-bar"].open) {
+    display: block !important;
+    position: fixed !important;
+    left: var(--nt-filter-left, 0px) !important;
+    top: var(--nt-filter-top, 0px) !important;
+    width: var(--nt-filter-width, 360px) !important;
+    height: var(--nt-filter-height, 700px) !important;
+    transform: scale(var(--nt-filter-scale, 1));
+    transform-origin: top left;
+    overflow: visible !important;
+    pointer-events: auto !important;
+    z-index: 10002 !important;
+    background: #fff !important;
+    box-shadow: 8px 0 28px rgba(20, 38, 30, .23) !important;
+  }
+  html.nt-dashboard-phone [data-test="dashboard-filters-panel"] > div,
+  html.nt-dashboard-phone [data-test="dashboard-filters-panel"] [data-test="filter-bar"],
+  html.nt-dashboard-phone [data-test="dashboard-filters-panel"] [data-test="filter-bar"].open > div.open {
+    width: var(--nt-filter-width, 360px) !important;
+    height: 100% !important;
+    min-height: 0 !important;
+  }
+  html.nt-dashboard-phone [data-test="dashboard-filters-panel"] [data-test="filter-bar"].open > div.open {
+    position: relative !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow: visible !important;
+  }
+  html.nt-dashboard-phone [data-test="filter-bar"].open > [data-test="filter-bar__collapsable"] { display: none !important; }
+  html.nt-dashboard-phone [data-test="filter-bar"].open > div.open > div:nth-child(2) {
+    flex: 1 1 auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    overscroll-behavior: contain;
+  }
+  html.nt-dashboard-phone [data-test="filterbar-action-buttons"] {
+    position: relative !important;
+    left: auto !important;
+    bottom: auto !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    flex: 0 0 auto !important;
+    z-index: 2 !important;
+    background: #fff !important;
+    padding: 10px 16px !important;
+    border-top: 1px solid #DCE5E0 !important;
+    box-shadow: 0 -4px 14px rgba(43, 48, 74, .12) !important;
+  }
+  html.nt-dashboard-phone [data-test="filterbar-action-buttons"] button { min-height: 44px !important; border-radius: 10px !important; }
+  html.nt-dashboard-phone [data-test="filterbar-action-buttons"] .ant-btn-primary { background-color: ${GREEN} !important; border-color: ${GREEN} !important; }
+  html.nt-dashboard-phone [data-test="filterbar-action-buttons"] .ant-btn-primary[disabled] { background-color: #E3EAE6 !important; border-color: #E3EAE6 !important; color: #8B9A93 !important; }
+  html.nt-dashboard-phone [data-test="edit-dashboard-button"],
+  html.nt-dashboard-phone [data-test="dashboard-edit-actions"],
+  html.nt-dashboard-phone [data-test="header-actions-menu"] li:has([data-test="save-as-menu-item"]),
+  html.nt-dashboard-phone button:has([data-test="filterbar-orientation-icon"]) { display: none !important; }
+  #nt-open-filters {
+    appearance: none; border: 1px solid ${GREEN}; border-radius: 10px;
+    background: ${GREEN}; color: #fff; font-weight: 700;
+    white-space: nowrap; cursor: pointer;
+  }
+  #nt-open-filters:focus-visible { outline: 3px solid #83C7A5; outline-offset: 2px; }
+  #nt-filter-backdrop {
+    position: fixed; background: rgba(20, 38, 30, .42);
+    z-index: 10001; touch-action: none;
+  }
 }`;
