@@ -134,13 +134,58 @@ body { overscroll-behavior-y: none; }
   html.nt-dashboard-phone [data-test="header-actions-menu"] li:has([data-test="save-as-menu-item"]),
   html.nt-dashboard-phone button:has([data-test="filterbar-orientation-icon"]) { display: none !important; }
   #nt-open-filters {
-    appearance: none; border: 1px solid ${GREEN}; border-radius: 10px;
-    background: ${GREEN}; color: #fff; font-weight: 700;
-    white-space: nowrap; cursor: pointer;
+    appearance: none; border: 0; border-radius: 0;
+    background: transparent; color: #2563B8; box-shadow: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    flex: 0 0 auto; cursor: pointer;
   }
+  #nt-open-filters:hover, #nt-open-filters:active { background: transparent; color: #174F98; }
+  html.nt-dashboard-phone .ant-dropdown-menu [aria-disabled="true"],
+  html.nt-dashboard-phone .ant-dropdown-menu-item-disabled,
+  html.nt-dashboard-phone .ant-dropdown-menu-item-divider,
+  html.nt-dashboard-phone .ant-dropdown-menu-item-group-title { display: none !important; }
+  html.nt-dashboard-phone [data-test="header-actions-menu"],
+  html.nt-dashboard-phone .ant-dropdown-menu:has([data-test="download-menu-item"]) {
+    min-width: 245px !important;
+    font-size: 15px !important;
+  }
+  html.nt-dashboard-phone [data-test="header-actions-menu"] [role="menuitem"],
+  html.nt-dashboard-phone [data-test="header-actions-menu"] li,
+  html.nt-dashboard-phone .nt-download-menu [role="menuitem"],
+  html.nt-dashboard-phone .nt-download-menu li {
+    min-height: 46px !important;
+    padding: 11px 16px !important;
+  }
+  html.nt-dashboard-phone .nt-download-menu { min-width: 245px !important; font-size: 15px !important; }
   #nt-open-filters:focus-visible { outline: 3px solid #83C7A5; outline-offset: 2px; }
   #nt-filter-backdrop {
     position: fixed; background: rgba(20, 38, 30, .42);
     z-index: 10001; touch-action: none;
   }
+}
+html:not(.nt-login) .ant-menu-submenu:has([data-test="new-dropdown-icon"]) { display: none !important; }
+html:not(.nt-login) a[href*="/dashboard/import"],
+html:not(.nt-login) a[href*="/dataset/add"] { display: none !important; }
+html:not(.nt-login) .nt-readonly-add {
+  color: #84919B !important; border-color: #D7DFE3 !important;
+  background: #F3F5F6 !important; opacity: .8 !important;
+  cursor: help !important;
+}
+/* Dashboard and chart list rows need enough vertical space for touch selection. */
+html.nt-resource-list .ant-table-tbody > tr > td,
+html.nt-resource-list .table tbody > tr > td {
+  padding-top: 10px !important;
+  padding-bottom: 10px !important;
+}
+html.nt-resource-list .ant-list-item { padding-top: 14px !important; padding-bottom: 14px !important; }
+html.nt-resource-list .ant-table-tbody > tr > td a,
+html.nt-resource-list .table tbody > tr > td a {
+  display: inline-flex !important;
+  align-items: center;
+  min-height: 44px;
+}
+html:not(.nt-login) .nt-home-card-grid {
+  max-height: none !important; overflow: visible !important;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)) !important;
+  padding-left: 16px !important; padding-right: 16px !important;
 }`;

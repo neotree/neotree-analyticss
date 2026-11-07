@@ -83,6 +83,8 @@ async function main() {
     console.log('Reusing this project\'s Metro server on port 8081.');
     await run(adb, ['-s', serial, 'reverse', 'tcp:8081', 'tcp:8081']);
     await run(adb, ['-s', serial, 'shell', 'am', 'start', '-n', 'app.neotree.analytics/.MainActivity']);
+    console.log('App launched. This command is complete; Metro remains active in its existing terminal.');
+    console.log('Use the Metro terminal for JavaScript logs and reload controls.');
     return;
   }
   await run(adb, ['-s', serial, 'reverse', 'tcp:8081', 'tcp:8081']);

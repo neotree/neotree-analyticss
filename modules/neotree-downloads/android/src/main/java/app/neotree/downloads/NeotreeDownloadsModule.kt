@@ -3,6 +3,11 @@ package app.neotree.downloads
 import android.app.DownloadManager
 import android.content.ContentValues
 import android.content.Context
+import android.graphics.BitmapFactory
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.pdf.PdfDocument
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
@@ -26,6 +31,36 @@ class NeotreeDownloadsModule : Module() {
 
   private val sessions = mutableMapOf<String, ExportSession>()
   private val maxExportBytes = 100L * 1024 * 1024
+
+  private fun imageToPdf(imageFile: File, pdfFile: File) {
+    val bitmap = BitmapFactory.decodeFile(imageFile.absolutePath)
+      ?: throw IllegalArgumentException("Could not decode dashboard image")
+    val pdf = PdfDocument()
+    try {
+      val pageWidth = 595
+      val pageHeight = 842
+      val margin = 20f
+      val contentWidth = pageWidth - 2 * margin
+      val contentHeight = pageHeight - 2 * margin
+      val sourcePageHeight = (contentHeight * bitmap.width / contentWidth).toInt().coerceAtLeast(1)
+      var top = 0
+      var pageNumber = 1
+      val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+      while (top < bitmap.height) {
+        val bottom = (top + sourcePageHeight).coerceAtMost(bitmap.height)
+        val page = pdf.startPage(PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber++).create())
+        val drawnHeight = (bottom - top) * contentWidth / bitmap.width
+        page.canvas.drawBitmap(bitmap, Rect(0, top, bitmap.width, bottom),
+          RectF(margin, margin, margin + contentWidth, margin + drawnHeight), paint)
+        pdf.finishPage(page)
+        top = bottom
+      }
+      FileOutputStream(pdfFile).use { pdf.writeTo(it) }
+    } finally {
+      pdf.close()
+      bitmap.recycle()
+    }
+  }
 
   private fun discard(id: String) {
     synchronized(sessions) {
@@ -58,7 +93,7 @@ class NeotreeDownloadsModule : Module() {
     }
 
     AsyncFunction("appendExport") { id: String, encoded: String ->
-      require(encoded.length <= 90_000) { "Export chunk is too large" }
+      require(encoded.length <= 360_000) { "Export chunk is too large" }
       val bytes = Base64.decode(encoded, Base64.DEFAULT)
       synchronized(sessions) {
         val session = sessions[id] ?: throw IllegalArgumentException("Unknown export")
@@ -77,20 +112,27 @@ class NeotreeDownloadsModule : Module() {
         sessions.remove(id) ?: throw IllegalArgumentException("Unknown export")
       }
       var uri: android.net.Uri? = null
+      var converted: File? = null
       try {
         session.output.close()
         require(session.written == session.expected) { "Export is incomplete" }
+        val convertToPdf = session.mime.startsWith("image/") && session.name.endsWith(".pdf", ignoreCase = true)
+        if (convertToPdf) {
+          val pdfFile = File.createTempFile("neotree-pdf-", ".pdf", context.cacheDir)
+          converted = pdfFile
+          imageToPdf(session.file, pdfFile)
+        }
         val resolver = context.contentResolver
         val values = ContentValues().apply {
           put(MediaStore.Downloads.DISPLAY_NAME, session.name)
-          put(MediaStore.Downloads.MIME_TYPE, session.mime)
+          put(MediaStore.Downloads.MIME_TYPE, if (convertToPdf) "application/pdf" else session.mime)
           put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
           put(MediaStore.Downloads.IS_PENDING, 1)
         }
         uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
           ?: throw IllegalStateException("Could not create Downloads file")
         resolver.openOutputStream(uri)?.use { output ->
-          session.file.inputStream().use { input -> input.copyTo(output) }
+          (converted ?: session.file).inputStream().use { input -> input.copyTo(output) }
         } ?: throw IllegalStateException("Could not write Downloads file")
         resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
         session.name
@@ -99,6 +141,7 @@ class NeotreeDownloadsModule : Module() {
         throw error
       } finally {
         session.file.delete()
+        converted?.delete()
       }
     }
 

@@ -50,7 +50,7 @@ export function parseExportMessage(data: string): ExportMessage | null {
             && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= 100 * 1024 * 1024 ? value : null;
     }
     if (value.type === 'export-chunk') {
-        return typeof value.data === 'string' && value.data.length <= 90_000 && /^[A-Za-z0-9+/=]*$/.test(value.data)
+        return typeof value.data === 'string' && value.data.length <= 360_000 && /^[A-Za-z0-9+/=]*$/.test(value.data)
             && Number.isSafeInteger(value.downloaded) && value.downloaded >= 0 ? value : null;
     }
     return value.type === 'export-finish' ? value : null;

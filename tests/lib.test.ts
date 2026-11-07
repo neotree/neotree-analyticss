@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 
 import { createRemoteApi } from '../src/lib/api';
-import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, isPageReadyMessage, pageKey, readBusyLabel, readyPageUrl } from '../src/lib/injected';
+import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, isFilterAppliedMessage, isPageReadyMessage, pageKey, pageKindFromUrl, readBusyLabel, readPageContext, readReadOnlyAddKind, readyPageUrl, shouldKeepDashboardVisible } from '../src/lib/injected';
 import { parseCountryRegistry } from '../src/lib/registry';
 import { resolveConfig, SyncError } from '../src/lib/sync';
 import type { Country, StoredConfig } from '../src/lib/types';
-import { buildLandingUrl, hostMatches, isNavigationAllowed, validateRemoteConfig } from '../src/lib/validation';
+import { buildLandingUrl, hostMatches, isAuthoringDestination, isNavigationAllowed, validateRemoteConfig } from '../src/lib/validation';
 
 const strict = { allowInsecure: false };
 const country: Country = { code: 'ZW', name: 'Zimbabwe', webeditorUrl: 'https://we.example.org', apiKey: 'k', landingPath: '/login/', allowedHosts: [] };
@@ -75,6 +75,11 @@ async function main() {
     assert.equal(nav('https://ss.example.org.evil.org/'), false);
     assert.equal(nav('https://sso.idp.org/', ['sso.idp.org']), true);
     assert.equal(nav('https://sso.idp.org:8443/', ['sso.idp.org']), false);
+    assert.equal(isAuthoringDestination('https://ss.example.org/chart/add', good.supersetUrl), true);
+    assert.equal(isAuthoringDestination('https://ss.example.org/dashboard/new/', good.supersetUrl), true);
+    assert.equal(isAuthoringDestination('https://ss.example.org/dashboard/import/', good.supersetUrl), true);
+    assert.equal(isAuthoringDestination('https://ss.example.org/superset/dashboard/5/', good.supersetUrl), false);
+    assert.equal(isAuthoringDestination('https://other.example.org/dashboard/new/', good.supersetUrl), false);
     assert.equal(buildLandingUrl('https://ss.example.org/sub/', '/login/'), 'https://ss.example.org/sub/login/');
 
     // --- version sync: cache vs fetch
@@ -195,12 +200,26 @@ async function main() {
     assert.ok(brandChildren[0].src.startsWith('data:image/png;base64,'));
     assert.ok(!script.includes('.react-grid-layout'), 'do not override Superset chart geometry');
     assert.deepEqual(bodyClasses, ['nt-login']);
-    assert.equal(isPageReadyMessage(messages[0], 'https://ss.example.org/login/'), true);
-    assert.equal(isPageReadyMessage(messages[0], 'https://ss.example.org/other/'), false);
+    const loginReady = messages.find(message => isAnyPageReadyMessage(message))!;
+    assert.deepEqual(readPageContext(messages[0]), { kind: 'sign-in', url: 'https://ss.example.org/login/' });
+    assert.deepEqual(readPageContext(loginReady), { kind: 'sign-in', url: 'https://ss.example.org/login/' });
+    assert.equal(isPageReadyMessage(loginReady, 'https://ss.example.org/login/'), true);
+    assert.equal(isPageReadyMessage(loginReady, 'https://ss.example.org/other/'), false);
     assert.equal(isPageReadyMessage('{"type":"activity"}', 'https://ss.example.org/login/'), false);
     assert.equal(isActivityMessage('{"type":"activity"}'), true);
     assert.equal(isActivityMessage('{"type":"other"}'), false);
     assert.equal(isActivityMessage('not json'), false);
+    assert.equal(pageKindFromUrl('https://ss.example.org/login/', '/login/'), 'sign-in');
+    assert.equal(pageKindFromUrl('https://ss.example.org/custom-auth/', '/custom-auth/'), 'sign-in');
+    assert.equal(pageKindFromUrl('https://ss.example.org/superset/dashboard/5/', '/login/'), 'dashboard');
+    assert.equal(pageKindFromUrl('https://ss.example.org/superset/welcome/', '/login/'), 'other');
+    assert.equal(readPageContext('{"type":"page-context","kind":"dashboard","url":"https://ss.example.org/superset/dashboard/5/"}')?.kind, 'dashboard');
+    assert.equal(readPageContext('{"type":"page-context","kind":"bogus","url":"https://ss.example.org/"}'), null);
+    assert.equal(shouldKeepDashboardVisible('https://ss.example.org/superset/dashboard/5', 'https://ss.example.org/superset/dashboard/5/?native_filters_key=abc'), true);
+    assert.equal(shouldKeepDashboardVisible('https://ss.example.org/superset/dashboard/5', 'https://ss.example.org/superset/dashboard/6/'), true);
+    assert.equal(shouldKeepDashboardVisible('https://ss.example.org/login', 'https://ss.example.org/superset/dashboard/5/'), false);
+    assert.equal(shouldKeepDashboardVisible('https://ss.example.org/superset/dashboard/5', 'https://ss.example.org/login/'), false);
+    assert.equal(shouldKeepDashboardVisible('https://ss.example.org/superset/dashboard/5', 'https://other.example.org/superset/dashboard/5/'), false);
     assert.ok(!script.includes('navigation-start'), 'in-app route changes must not trigger a native loading cover');
     const homeNodes: any[] = [];
     const homePage = { ...page, head: { appendChild: (node: any) => homeNodes.push(node) }, documentElement: { appendChild: (node: any) => homeNodes.push(node) } };
@@ -229,11 +248,87 @@ async function main() {
         assert.equal(new URL(calls[1]).searchParams.get('expand_filters'), '0');
         history.pushState(null, '', '/superset/dashboard/6/?expand_filters=1');
         assert.equal(new URL(calls[2], route).searchParams.get('expand_filters'), '1');
+        const navigationsBeforeAdd = calls.length;
+        history.pushState(null, '', '/chart/add');
+        assert.equal(calls.length, navigationsBeforeAdd, 'chart creation must not mount through SPA history');
+        assert.equal(readReadOnlyAddKind(messages[messages.length - 1]), 'Chart');
+    }
+    {
+        const clickHandlers: ((event: any) => void)[] = [];
+        const windowClicks: ((event: any) => void)[] = [];
+        const blocked: string[] = [];
+        const rootClasses = new Set<string>();
+        const styled = (textContent: string, display = ''): any => ({
+            textContent,
+            style: { display, setProperty(_name: string, value: string) { this.display = value; }, removeProperty() { this.display = ''; } },
+            parentElement: null,
+        });
+        const security = styled('Security');
+        const logout = styled('Logout', 'none');
+        const info = styled('Info');
+        const about = styled('About');
+        const user = styled('User Info Logout');
+        const settingsPopup: any = {
+            textContent: 'Security User Info Logout About',
+            classList: { add() {} },
+            querySelectorAll: (selector: string) => selector === 'li' ? [security, user, info, logout, about]
+                : selector.includes('a, button') ? [info, logout, about] : [],
+        };
+        for (const item of [security, user, info, logout, about]) item.parentElement = settingsPopup;
+        const menuItem: any = {
+            textContent: 'Chart',
+            getAttribute: () => null,
+            closest: () => null,
+            matches: (selector: string) => selector.includes('button'),
+            querySelector: (selector: string) => selector === 'svg' ? {} : null,
+        };
+        const fakeDocument: any = {
+            ...page,
+            body: { childElementCount: 0 },
+            documentElement: { ...page.documentElement, classList: { add: (name: string) => rootClasses.add(name), remove: (name: string) => rootClasses.delete(name), contains: (name: string) => rootClasses.has(name) } },
+            head: { appendChild() {} },
+            querySelector: () => null,
+            querySelectorAll: (selector: string) => selector.includes('.ant-menu-submenu-popup ul') ? [settingsPopup] : [],
+            addEventListener: (name: string, listener: (event: any) => void) => { if (name === 'click') clickHandlers.push(listener); },
+        };
+        vm.runInNewContext(script, {
+            document: fakeDocument,
+            location: { origin: 'https://ss.example.org', pathname: '/chart/list/', href: 'https://ss.example.org/chart/list/' },
+            window: { ...webWindow, __ntInit: false, addEventListener: (name: string, listener: (event: any) => void) => { if (name === 'click') windowClicks.push(listener); }, ReactNativeWebView: { postMessage: (message: string) => blocked.push(message) } },
+            Event: class {}, URL,
+        });
+        let prevented = false;
+        let stopped = false;
+        const click = {
+            target: { closest: (selector: string) => selector.includes('[role="menuitem"]') ? menuItem : null },
+            preventDefault: () => { prevented = true; },
+            stopImmediatePropagation: () => { stopped = true; },
+        };
+        for (const listener of windowClicks) { listener(click); if (stopped) break; }
+        if (!stopped) for (const listener of clickHandlers) listener(click);
+        assert.equal(prevented, true, '+Chart menu clicks must be prevented before navigation');
+        assert.equal(stopped, true, '+Chart menu clicks must not reach Superset navigation handlers');
+        assert.equal(blocked.some(message => readReadOnlyAddKind(message) === 'Chart'), true);
+        assert.equal(rootClasses.has('nt-resource-list'), true, 'chart list gets larger tap targets');
+        assert.equal(security.style.display, 'none', 'administrative Settings rows stay hidden');
+        assert.equal(logout.style.display, '', 'Logout remains visible even if an earlier pass hid it');
     }
     const tabletNodes: any[] = [];
     const tabletPage = { ...page, head: { appendChild: (node: any) => tabletNodes.push(node) }, documentElement: { appendChild: (node: any) => tabletNodes.push(node) } };
     vm.runInNewContext(script, { document: tabletPage, location: { origin: 'https://ss.example.org', pathname: '/superset/welcome/', href: 'https://ss.example.org/superset/welcome/' }, window: { ...webWindow, screen: { width: 820 }, __ntInit: false }, Event: class {} });
-    assert.ok(tabletNodes.some(node => node.name === 'viewport' && node.content.includes('width=device-width') && node.content.includes('initial-scale=1') && node.content.includes('user-scalable=yes')), 'larger screens use their own width and remain zoomable');
+    assert.ok(tabletNodes.some(node => node.name === 'viewport' && node.content.includes('width=1024') && node.content.includes('user-scalable=yes')), 'portrait tablets keep horizontal Superset navigation');
+    {
+        const redirected: string[] = [];
+        const notices: string[] = [];
+        vm.runInNewContext(script, {
+            document: { ...page, head: { appendChild() {} }, documentElement: { appendChild() {} } },
+            location: { origin: 'https://ss.example.org', pathname: '/chart/add', href: 'https://ss.example.org/chart/add', replace: (url: string) => redirected.push(url) },
+            window: { ...webWindow, __ntInit: false, ReactNativeWebView: { postMessage: (message: string) => notices.push(message) } },
+            Event: class {}, URL,
+        });
+        assert.equal(redirected[0], 'https://ss.example.org/chart/list/', 'a chart creation page must redirect back to the read-only list');
+        assert.equal(readReadOnlyAddKind(notices[0]), 'Chart');
+    }
     // dashboards: not ready while the React root is empty (blank page); ready as soon as the shell/skeleton renders
     {
         const timers: (() => void)[] = [];
@@ -263,6 +358,10 @@ async function main() {
     }
     assert.equal(readBusyLabel('{"type":"busy","label":"Signing in…"}'), 'Signing in…');
     assert.equal(readBusyLabel('{"type":"activity"}'), null);
+    assert.equal(readReadOnlyAddKind('{"type":"read-only-add","kind":"Chart"}'), 'Chart');
+    assert.equal(readReadOnlyAddKind('{"type":"read-only-add","kind":"Dashboard"}'), 'Dashboard');
+    assert.equal(readReadOnlyAddKind('{"type":"read-only-add","kind":"Import"}'), null);
+    assert.equal(isFilterAppliedMessage('{"type":"filter-applied"}'), true);
     assert.equal(readBusyLabel('nope'), null);
 
     // Wide content does not change the fitted viewport or force a zoom level.

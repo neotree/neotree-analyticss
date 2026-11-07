@@ -86,3 +86,15 @@ export function isNavigationAllowed(url: string, supersetUrl: string, allowedHos
     // to the default HTTPS port; a custom port is accepted only for the exact configured origin.
     return target.origin === base.origin || (target.protocol === 'https:' && !target.port && hostMatches(target.hostname, allowedHosts));
 }
+
+/** Hide authoring routes from this read-only WebView without showing a blocked-host warning. */
+export function isAuthoringDestination(url: string, supersetUrl: string): boolean {
+    try {
+        const target = new URL(url);
+        if (target.origin !== new URL(supersetUrl).origin) return false;
+        return /\/(?:chart\/add|dashboard\/(?:new|import)|dataset\/add)(?:\/|$)/i.test(target.pathname)
+            || (/\/sqllab\/?$/i.test(target.pathname) && target.searchParams.get('new') === 'true');
+    } catch {
+        return false;
+    }
+}

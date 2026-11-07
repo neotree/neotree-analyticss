@@ -20,7 +20,9 @@ own loading skeletons take over; the app never waits for charts. Submitting a fo
 The login page uses the device-width viewport. Signed-in pages use at least 768px of layout width: Android fits that layout to smaller phones, while devices 768px or wider use their own width. The app does not change device orientation. Users can pinch zoom and pan. On phones, Apply/Clear stays at the bottom of the filter overlay.
 `scalesPageToFit` stays on so Android respects the viewport setting. Pinch zoom remains available on signed-in pages. Filter fields use a readable font size to avoid focus zoom, while Apply/Clear stays pinned at the bottom.
 Phone dashboards start with Superset's native filter panel collapsed, giving charts the full dashboard width. A Filters button in the dashboard header opens the native panel as a phone-sized overlay. The dashboard stays visible behind it; Apply/Clear stays reachable when the keyboard opens. Dashboard authoring controls are hidden in this mobile UI.
+Applying dashboard filters leaves the updated charts visible. The app's full-page loading cover is reserved for first load, sign-in, and other page transitions that have no dashboard on screen.
 Android HTTP downloads show progress in the app and the system notification. Superset-generated PDF, image, CSV, and ZIP files use the WebView export bridge, which saves them to the device's Downloads folder and shows preparation, progress, completion, or failure in the app. The export bridge requires a rebuilt Android app and Android 10 or newer.
+When Android reports no usable network, the app shows an offline message for the page on screen: sign-in asks the user to reconnect before signing in; a loaded dashboard stays visible with a stale-data warning; other Superset pages use general wording. Failed loads retry when connectivity returns. A reachable network does not imply that Superset itself is available, so server errors retain their separate message.
 
 Version checks run on every app start and at most once per minute when the app returns to the foreground,
 de-duplicated while a check is in flight. The visible Retry button always checks immediately. Failed checks do not update the saved last-checked time.
@@ -43,6 +45,7 @@ npm run typecheck
 nonstreaming install mode, which works around phones that reject Expo's default streamed install.
 The debug APK loads JavaScript from Metro on port 8081. The runner forwards that port over USB;
 if this project's Metro is already running there, it reuses it. Stop a different server on 8081 before retrying.
+In that case `npm run android` returns to the shell after launching the app; Metro keeps running in its original terminal.
 After the first native build, use `npm start` for JavaScript-only changes.
 
 If an Android run still prints `› Installing ... CommandError: adb: failed to install`, check the first

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, BackHandler, Pressable, StyleSheet, Text, View } from 'react-native';
+import { AppState, BackHandler, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { useNetworkState } from 'expo-network';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { WebView, type WebViewMessageEvent, type WebViewNavigation, type WebViewProps } from 'react-native-webview';
 import type { ShouldStartLoadRequest, WebViewHttpErrorEvent } from 'react-native-webview/lib/WebViewTypes';
@@ -9,10 +10,10 @@ import { Spinner } from '../components/Spinner';
 import { useConfigSync } from '../hooks/useConfigSync';
 import { useInactivity } from '../hooks/useInactivity';
 import { abortExport, canTrackDownloads, downloadStatus, listDownloads, parseExportMessage, saveExportMessage, type AndroidDownload } from '../lib/downloads';
-import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, pageKey, readBusyLabel, readyPageUrl } from '../lib/injected';
+import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, isFilterAppliedMessage, pageKey, pageKindFromUrl, readBusyLabel, readPageContext, readReadOnlyAddKind, readyPageUrl, shouldKeepDashboardVisible, type AnalyticsPageKind } from '../lib/injected';
 import { bestEffortLogout } from '../lib/logout';
 import type { ConfigStore, Country } from '../lib/types';
-import { buildLandingUrl, isNavigationAllowed } from '../lib/validation';
+import { buildLandingUrl, isAuthoringDestination, isNavigationAllowed } from '../lib/validation';
 import { brand, useTheme } from '../theme';
 
 // react-native-webview's `WebView<P>` class declaration is circular under TypeScript 6, which makes its JSX
@@ -32,23 +33,75 @@ type ExportProgress = { id: string; name: string; status: 'preparing' | 'saving'
 
 export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry, onLock }: Props) {
     const t = useTheme();
+    const network = useNetworkState();
+    const offline = network.isConnected === false || network.isInternetReachable === false;
+    const wasOffline = useRef(false);
     const { state, retry, refresh, recheck } = useConfigSync(country, store, allowInsecure);
     const webViewRef = useRef<WebViewHandle>(null);
     const canGoBack = useRef(false);
     const loadingUrl = useRef<string | null>(null);
     const readyPage = useRef<string | null>(null);
+    const filterAppliedAt = useRef(0);
+    const readOnlyAlertAt = useRef(0);
     const revealTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [pageError, setPageError] = useState<string | null>(null);
     const [readySource, setReadySource] = useState<string | null>(null);
     const [coverLabel, setCoverLabel] = useState('Loading…');
+    const [reportedPage, setReportedPage] = useState<{ kind: AnalyticsPageKind; url: string } | null>(null);
     const [blockedHost, setBlockedHost] = useState<string | null>(null);
     const [download, setDownload] = useState<AndroidDownload | null>(null);
     const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+    const [exportElapsed, setExportElapsed] = useState(0);
+    const [readOnlyDialog, setReadOnlyDialog] = useState<'Chart' | 'Dashboard' | null>(null);
     const seenDownloads = useRef<Set<string> | null>(null);
 
     const config = state.status === 'ready' ? state.config : null;
     const supersetUrl = config?.supersetUrl;
     const pageReady = !!supersetUrl && readySource === supersetUrl;
+    const filterResultVisible = reportedPage?.kind === 'dashboard' && Date.now() - filterAppliedAt.current < 60_000;
+    const explainReadOnly = useCallback((kind: 'Chart' | 'Dashboard') => {
+        if (Date.now() - readOnlyAlertAt.current < 1200) return;
+        readOnlyAlertAt.current = Date.now();
+        setReadOnlyDialog(kind);
+    }, []);
+    const currentPageKind = reportedPage?.kind ?? pageKindFromUrl(
+        loadingUrl.current ?? (supersetUrl ? buildLandingUrl(supersetUrl, country.landingPath) : null),
+        country.landingPath,
+    );
+    const offlineNotice = currentPageKind === 'sign-in'
+        ? 'No internet connection. Connect to Wi-Fi or mobile data to sign in.'
+        : currentPageKind === 'dashboard'
+            ? 'No internet connection. This dashboard may be out of date. It will stay open while you reconnect.'
+            : 'No internet connection. This page may be out of date. Reconnect to load new information.';
+    const offlinePageTitle = currentPageKind === 'sign-in' ? 'Sign-in unavailable offline'
+        : currentPageKind === 'dashboard' ? 'Dashboard unavailable offline' : 'Analytics unavailable offline';
+    const offlinePageMessage = currentPageKind === 'sign-in'
+        ? 'Connect to Wi-Fi or mobile data, then try signing in again.'
+        : currentPageKind === 'dashboard'
+            ? 'Connect to Wi-Fi or mobile data. The dashboard will retry when your connection returns.'
+            : 'Connect to Wi-Fi or mobile data. This page will retry when your connection returns.';
+
+    // Restore only a page that failed while offline. Keep an already visible
+    // dashboard in place so reconnecting does not discard its filter state.
+    useEffect(() => {
+        if (offline) {
+            wasOffline.current = true;
+            return;
+        }
+        if (!wasOffline.current || (network.isConnected !== true && network.isInternetReachable !== true)) return;
+        // An in-flight Webeditor request may still finish with its offline error.
+        // Retry after it settles so the reconnect is not lost to deduplication.
+        if (state.status === 'loading') return;
+        wasOffline.current = false;
+        if (state.status === 'error') void retry();
+        else if (state.status === 'ready') {
+            if (pageError) {
+                setReadySource(null);
+                setPageError(null);
+            } else if (!pageReady) webViewRef.current?.reload();
+            void refresh();
+        }
+    }, [offline, network.isConnected, network.isInternetReachable, state.status, pageError, pageReady, retry, refresh]);
 
     const endSession = useCallback(async (then: () => void) => {
         if (supersetUrl) bestEffortLogout(supersetUrl);
@@ -88,9 +141,19 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         ? buildInjectedScript({ landingPathname: new URL(landingUrl).pathname, supersetOrigin: new URL(landingUrl).origin })
         : ''), [landingUrl]);
 
+    useEffect(() => { setReportedPage(null); }, [landingUrl]);
+
     useEffect(() => () => {
         if (revealTimer.current) clearTimeout(revealTimer.current);
     }, []);
+
+    useEffect(() => {
+        if (exportProgress?.status !== 'preparing') return;
+        setExportElapsed(0);
+        const started = Date.now();
+        const timer = setInterval(() => setExportElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+        return () => clearInterval(timer);
+    }, [exportProgress?.id, exportProgress?.status]);
 
     // WebView queues HTTP attachments in Android DownloadManager. Poll this app's
     // downloads so progress and completion appear in the app as well as Android's notification.
@@ -129,10 +192,10 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
 
     // A stalled page load must never leave an opaque spinner over a usable WebView.
     useEffect(() => {
-        if (!supersetUrl || pageReady || pageError) return;
+        if (!supersetUrl || pageReady || pageError || offline) return;
         const timer = setTimeout(() => setReadySource(supersetUrl), 15_000);
         return () => clearTimeout(timer);
-    }, [supersetUrl, pageReady, pageError]);
+    }, [supersetUrl, pageReady, pageError, offline]);
 
     const onMessage = useCallback((e: WebViewMessageEvent) => {
         const exportMessage = parseExportMessage(e.nativeEvent.data);
@@ -141,7 +204,8 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                 setExportProgress({ id: exportMessage.id, name: exportMessage.name, status: 'preparing', downloaded: 0, total: 0 });
             } else if (exportMessage.type === 'export-abort') {
                 void abortExport(exportMessage.id);
-                setExportProgress(previous => previous?.id === exportMessage.id
+                if (exportMessage.error === 'Cancelled') setExportProgress(null);
+                else setExportProgress(previous => previous?.id === exportMessage.id
                     ? { ...previous, status: 'failed', error: exportMessage.error }
                     : { id: exportMessage.id, name: exportMessage.name, status: 'failed', downloaded: 0, total: 0, error: exportMessage.error });
             } else {
@@ -167,8 +231,14 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
             return;
         }
         if (isActivityMessage(e.nativeEvent.data)) markActivity();
+        if (isFilterAppliedMessage(e.nativeEvent.data)) filterAppliedAt.current = Date.now();
+        const readOnlyKind = readReadOnlyAddKind(e.nativeEvent.data);
+        if (readOnlyKind) explainReadOnly(readOnlyKind);
+        const context = readPageContext(e.nativeEvent.data);
+        if (context) setReportedPage(context);
         const busy = readBusyLabel(e.nativeEvent.data);
-        if (busy) {
+        if (busy && !(pageReady && (shouldKeepDashboardVisible(readyPage.current, e.nativeEvent.url)
+            || (Date.now() - filterAppliedAt.current < 60_000 && pageKindFromUrl(e.nativeEvent.url, country.landingPath) === 'dashboard')))) {
             // A form (e.g. sign-in) is being submitted: cover immediately, even though the next page may share
             // this page's path, and say what is happening.
             readyPage.current = null;
@@ -180,16 +250,18 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
             setReadySource(supersetUrl ?? null);
             setCoverLabel('Loading…');
         }
-    }, [markActivity, supersetUrl]);
+    }, [markActivity, supersetUrl, pageReady, explainReadOnly, country.landingPath]);
 
-    if (state.status === 'loading') return <LoadingView message="Checking Webeditor configuration…" />;
+    if (state.status === 'loading') return offline
+        ? <ErrorView title="You're offline" message="Connect to Wi-Fi or mobile data. The app will try again when your connection returns." panel actions={[{ label: 'Try again', onPress: retry }, { label: 'Switch country', onPress: onSwitchCountry, secondary: true }]} />
+        : <LoadingView message="Checking Webeditor configuration…" />;
 
     if (state.status === 'error') {
         return (
             <ErrorView
-                title={state.title}
-                message={state.message}
-                supportCode={state.supportCode}
+                title={offline ? "You're offline" : state.title}
+                message={offline ? 'Connect to Wi-Fi or mobile data. The app will try again when your connection returns.' : state.message}
+                supportCode={offline ? undefined : state.supportCode}
                 panel
                 actions={[
                     { label: 'Try again', onPress: retry },
@@ -208,7 +280,15 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                 </Pressable>
             </View>
 
-            {!!state.verifyError && (
+            {offline && !pageError && pageReady && (
+                <View style={styles.offlineBanner}>
+                    <Text accessibilityRole="alert" style={styles.offlineText}>
+                        {offlineNotice}
+                    </Text>
+                </View>
+            )}
+
+            {!!state.verifyError && !offline && (
                 <View style={[styles.banner, { backgroundColor: t.danger }]}>
                     <Text accessibilityRole="alert" style={styles.bannerText}>
                         {state.usingSavedConfig ? 'Webeditor unavailable; using saved settings. Superset may still be accessible. ' : 'Configuration check failed: '}
@@ -242,8 +322,8 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                                 : downloadStatus(download) === 'failed'
                                     ? download.name
                                     : download.total > 0
-                                        ? `${download.name} · ${Math.min(100, Math.round(download.downloaded / download.total * 100))}%`
-                                        : `${download.name} · check Android notification for progress`}
+                                        ? download.name
+                                        : `${download.name} · waiting for file size`}
                         </Text>
                         {downloadStatus(download) === 'active' && download.total > 0 && (
                             <View style={[styles.downloadTrack, { backgroundColor: t.border }]}>
@@ -251,6 +331,9 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                             </View>
                         )}
                     </View>
+                    {downloadStatus(download) === 'active' && download.total > 0 && (
+                        <Text style={[styles.progressValue, { color: t.primary }]}>{Math.min(100, Math.round(download.downloaded / download.total * 100))}%</Text>
+                    )}
                     {downloadStatus(download) !== 'active' && (
                         <Pressable accessibilityRole="button" onPress={() => setDownload(null)} hitSlop={12}>
                             <Text style={[styles.downloadDismiss, { color: t.primary }]}>Dismiss</Text>
@@ -270,8 +353,8 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                             {exportProgress.status === 'complete' ? `Saved to Downloads/${exportProgress.name}`
                                 : exportProgress.status === 'failed' ? exportProgress.error || 'Could not save the file'
                                 : exportProgress.status === 'saving' && exportProgress.total > 0
-                                    ? `${exportProgress.name} · ${Math.min(100, Math.round(exportProgress.downloaded / exportProgress.total * 100))}%`
-                                    : exportProgress.name}
+                                    ? exportProgress.name
+                                    : `${exportProgress.name} · ${exportElapsed}s`}
                         </Text>
                         {exportProgress.status === 'saving' && exportProgress.total > 0 && (
                             <View style={[styles.downloadTrack, { backgroundColor: t.border }]}>
@@ -279,15 +362,23 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                             </View>
                         )}
                     </View>
+                    {exportProgress.status === 'saving' && exportProgress.total > 0 && (
+                        <Text style={[styles.progressValue, { color: t.primary }]}>{Math.min(100, Math.round(exportProgress.downloaded / exportProgress.total * 100))}%</Text>
+                    )}
                     {(exportProgress.status === 'complete' || exportProgress.status === 'failed') && (
                         <Pressable accessibilityRole="button" onPress={() => setExportProgress(null)} hitSlop={12}>
                             <Text style={[styles.downloadDismiss, { color: t.primary }]}>Dismiss</Text>
                         </Pressable>
                     )}
+                    {exportProgress.status === 'preparing' && exportProgress.name === 'Preparing dashboard PDF' && (
+                        <Pressable accessibilityRole="button" onPress={() => webViewRef.current?.injectJavaScript('window.__ntCancelPdfWait && window.__ntCancelPdfWait();true;')} hitSlop={12}>
+                            <Text style={[styles.downloadDismiss, { color: t.primary }]}>Cancel</Text>
+                        </Pressable>
+                    )}
                 </View>
             )}
 
-            <View style={styles.webWrap}>
+            <View style={[styles.webWrap, currentPageKind !== 'sign-in' && styles.webSpacing]}>
                 {landingUrl && !pageError && (
                     <SupersetWebView
                         // New URL => remount (full reload). A changed timeout or version does not reload.
@@ -303,31 +394,44 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                         onMessage={onMessage}
                         onLoadStart={e => {
                             loadingUrl.current = e.nativeEvent.url;
+                            if (pageKindFromUrl(e.nativeEvent.url, country.landingPath) !== 'dashboard') filterAppliedAt.current = 0;
                             // Every full document load (login, redirects, legacy pages) is covered until the
                             // page reports it has rendered. In-app route changes never reach here, so they
                             // are never covered: Superset shows its own placeholders for those.
                             // A reload of the page already on screen (Superset rewriting the URL after a filter is
                             // applied, a same-page refresh) keeps it visible: covering it would flash a spinner
                             // over content that is already correct.
-                            if (pageReady && readyPage.current && pageKey(e.nativeEvent.url) === readyPage.current) return;
+                            if (pageReady && (
+                                (reportedPage?.kind === 'dashboard' && Date.now() - filterAppliedAt.current < 60_000)
+                                || (readyPage.current && (pageKey(e.nativeEvent.url) === readyPage.current
+                                    || shouldKeepDashboardVisible(readyPage.current, e.nativeEvent.url)))
+                                || (reportedPage?.kind === 'dashboard' && pageKindFromUrl(e.nativeEvent.url, country.landingPath) === 'dashboard')
+                            )) return;
                             setReadySource(null);
                         }}
                         onLoadEnd={() => {
                             if (revealTimer.current) clearTimeout(revealTimer.current);
                             // The page's own "ready" signal (after charts settle) lifts the cover. This is only
                             // a backstop for a page whose bridge is blocked, so it is deliberately late.
-                            revealTimer.current = setTimeout(() => setReadySource(supersetUrl ?? null), 10_000);
+                            if (!offline) revealTimer.current = setTimeout(() => setReadySource(supersetUrl ?? null), 10_000);
                         }}
                         onNavigationStateChange={(nav: WebViewNavigation) => {
                             canGoBack.current = nav.canGoBack;
                         }}
                         onShouldStartLoadWithRequest={(req: ShouldStartLoadRequest) => {
+                            if (currentPageKind === 'dashboard' && /\/explore\/?(?:[?#]|$)/i.test(req.url)) return false;
+                            if (isAuthoringDestination(req.url, supersetUrl!)) {
+                                if (/\/chart\/add(?:\/|$)/i.test(new URL(req.url).pathname)) explainReadOnly('Chart');
+                                else if (/\/dashboard\/new(?:\/|$)/i.test(new URL(req.url).pathname)) explainReadOnly('Dashboard');
+                                return false;
+                            }
                             if (isNavigationAllowed(req.url, supersetUrl!, country.allowedHosts, { allowInsecure })) return true;
                             try { setBlockedHost(new URL(req.url).hostname || req.url); } catch { setBlockedHost('an unknown destination'); }
                             return false;
                         }}
                         onError={() => {
                             if (revealTimer.current) clearTimeout(revealTimer.current);
+                            if (offline && pageReady) return;
                             setPageError('Superset is not accessible. Check your connection or try again later.');
                         }}
                         onHttpError={(e: WebViewHttpErrorEvent) => {
@@ -358,8 +462,8 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
 
                 {!!pageError && (
                     <ErrorView
-                        title="Analytics unavailable"
-                        message={pageError}
+                        title={offline ? offlinePageTitle : 'Analytics unavailable'}
+                        message={offline ? offlinePageMessage : pageError}
                         actions={[
                             { label: 'Retry', onPress: () => { setReadySource(null); loadingUrl.current = null; setPageError(null); } },
                             { label: 'Switch country', onPress: () => endSession(onSwitchCountry), secondary: true },
@@ -367,10 +471,37 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                     />
                 )}
 
-                {landingUrl && !pageError && !pageReady && <LoadingCover label={coverLabel} />}
+                {landingUrl && !pageError && !pageReady && !filterResultVisible && (offline
+                    ? <View style={StyleSheet.absoluteFill}>
+                        <ErrorView
+                            title={offlinePageTitle}
+                            message={offlinePageMessage}
+                            actions={[{ label: 'Try again', onPress: () => webViewRef.current?.reload() }]}
+                        />
+                    </View>
+                    : <LoadingCover label={coverLabel} />)}
             </View>
 
             {covered && <PrivacyCover />}
+            <Modal visible={!!readOnlyDialog} transparent animationType="fade" onRequestClose={() => setReadOnlyDialog(null)}>
+                <View style={styles.dialogBackdrop}>
+                    <Pressable style={StyleSheet.absoluteFill} onPress={() => setReadOnlyDialog(null)} accessibilityLabel="Close notice" />
+                    <View style={[styles.dialogCard, { backgroundColor: t.surface }]}>
+                        <View style={[styles.dialogIcon, { backgroundColor: '#E8F3ED' }]}>
+                            <Text style={[styles.dialogIconText, { color: t.primary }]}>i</Text>
+                        </View>
+                        <Text style={[styles.dialogTitle, { color: t.text }]}>View only on mobile</Text>
+                        <Text style={[styles.dialogMessage, { color: t.muted }]}>
+                            {readOnlyDialog === 'Chart'
+                                ? 'You can view charts here. To add a chart, open Superset on a computer.'
+                                : 'You can view dashboards here. To add a dashboard, open Superset on a computer.'}
+                        </Text>
+                        <Pressable accessibilityRole="button" onPress={() => setReadOnlyDialog(null)} style={[styles.dialogButton, { backgroundColor: t.primary }]}>
+                            <Text style={styles.dialogButtonText}>Got it</Text>
+                        </Pressable>
+                    </View>
+                </View>
+            </Modal>
         </SafeAreaView>
     );
 }
@@ -384,7 +515,10 @@ const styles = StyleSheet.create({
     banner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 8, gap: 12 },
     bannerText: { color: '#FFFFFF', fontSize: 13, flex: 1 },
     bannerAction: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', textDecorationLine: 'underline' },
+    offlineBanner: { backgroundColor: '#F8EBC4', paddingHorizontal: 16, paddingVertical: 10 },
+    offlineText: { color: brand.navy, fontSize: 13, lineHeight: 18 },
     webWrap: { flex: 1 },
+    webSpacing: { marginTop: 12 },
     downloadBanner: { borderBottomWidth: 1, paddingHorizontal: 14, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 12 },
     downloadDetails: { flex: 1 },
     downloadTitle: { fontSize: 14, fontWeight: '700' },
@@ -392,4 +526,13 @@ const styles = StyleSheet.create({
     downloadTrack: { height: 4, borderRadius: 2, marginTop: 6, overflow: 'hidden' },
     downloadFill: { height: 4, borderRadius: 2 },
     downloadDismiss: { fontSize: 12, fontWeight: '700' },
+    progressValue: { fontSize: 16, fontWeight: '800', minWidth: 44, textAlign: 'right' },
+    dialogBackdrop: { flex: 1, backgroundColor: 'rgba(20, 38, 30, .45)', alignItems: 'center', justifyContent: 'center', padding: 24 },
+    dialogCard: { width: '100%', maxWidth: 380, borderRadius: 20, padding: 24, alignItems: 'center', elevation: 8 },
+    dialogIcon: { width: 46, height: 46, borderRadius: 23, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
+    dialogIconText: { fontSize: 23, fontWeight: '700' },
+    dialogTitle: { fontSize: 19, fontWeight: '700', textAlign: 'center' },
+    dialogMessage: { fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 10, marginBottom: 22 },
+    dialogButton: { minHeight: 46, width: '100%', borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+    dialogButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
 });
