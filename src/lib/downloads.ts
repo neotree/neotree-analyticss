@@ -1,6 +1,10 @@
 import { Platform } from 'react-native';
 import { requireOptionalNativeModule } from 'expo';
 
+import type { ExportMessage } from './exportMessages';
+
+export { parseExportMessage, type ExportMessage } from './exportMessages';
+
 export type AndroidDownload = {
     id: string;
     name: string;
@@ -9,55 +13,57 @@ export type AndroidDownload = {
     total: number;
 };
 
-export type ExportMessage =
-    | { type: 'export-prepare'; id: string; name: string }
-    | { type: 'export-start'; id: string; name: string; mime: string; size: number; sequence: number }
-    | { type: 'export-chunk'; id: string; data: string; downloaded: number; sequence: number }
-    | { type: 'export-finish'; id: string; sequence: number }
-    | { type: 'export-abort'; id: string; name: string; error: string };
-
 type NativeDownloads = {
-    listDownloads: () => Promise<AndroidDownload[]>;
     startExport: (id: string, name: string, mime: string, size: number) => Promise<string>;
     appendExport: (id: string, data: string) => Promise<number>;
     finishExport: (id: string) => Promise<string>;
     abortExport: (id: string) => Promise<void>;
+    /** Android only: this app's DownloadManager entries. */
+    listDownloads?: () => Promise<AndroidDownload[]>;
+    /** iOS and Android 7-9: finished exports live in a private folder until saved/shared or discarded. */
+    shareExport?: (id: string) => Promise<boolean>;
+    discardExport?: (id: string) => Promise<void>;
+    discardAllExports?: () => Promise<void>;
 };
 
-const native = Platform.OS === 'android'
+const native = Platform.OS === 'android' || Platform.OS === 'ios'
     ? requireOptionalNativeModule<NativeDownloads>('NeotreeDownloads')
     : null;
 
-export const canTrackDownloads = !!native;
+export const canTrackDownloads = Platform.OS === 'android' && typeof native?.listDownloads === 'function';
+
+/**
+ * True where a finished export is not written to Downloads automatically and the user saves it instead:
+ * iOS (share sheet, "Save to Files") and Android 7-9 (system "Save as" picker; no storage permission).
+ */
+export const sharesExports = typeof native?.shareExport === 'function'
+    && (Platform.OS === 'ios' || (Platform.OS === 'android' && Number(Platform.Version) < 29));
+
+/** Word for a completed save, matching what the platform's sheet offers. */
+export const exportDoneLabel = Platform.OS === 'ios' ? 'shared' : 'saved';
 
 export async function listDownloads(): Promise<AndroidDownload[]> {
-    return native ? native.listDownloads() : [];
+    return native?.listDownloads ? native.listDownloads() : [];
 }
 
-export function parseExportMessage(data: string): ExportMessage | null {
-    let value: any;
-    try { value = JSON.parse(data); } catch { return null; }
-    if (!value || typeof value !== 'object' || typeof value.id !== 'string' || !/^export_[A-Za-z0-9_]+$/.test(value.id) || value.id.length > 64) return null;
-    if (value.type === 'export-prepare' || value.type === 'export-abort') {
-        if (typeof value.name !== 'string' || value.name.length > 128) return null;
-        if (value.type === 'export-abort' && (typeof value.error !== 'string' || value.error.length > 300)) return null;
-        return value;
-    }
-    if (!Number.isSafeInteger(value.sequence) || value.sequence < 1) return null;
-    if (value.type === 'export-start') {
-        return typeof value.name === 'string' && value.name.length <= 128
-            && typeof value.mime === 'string' && value.mime.length <= 100
-            && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= 100 * 1024 * 1024 ? value : null;
-    }
-    if (value.type === 'export-chunk') {
-        return typeof value.data === 'string' && value.data.length <= 360_000 && /^[A-Za-z0-9+/=]*$/.test(value.data)
-            && Number.isSafeInteger(value.downloaded) && value.downloaded >= 0 ? value : null;
-    }
-    return value.type === 'export-finish' ? value : null;
+/** Opens the share sheet (iOS) or "Save as" picker (Android 7-9). Resolves true if the user saved or shared it. */
+export async function shareExport(id: string): Promise<boolean> {
+    if (!native?.shareExport) throw new Error('Sharing exports is not available on this device');
+    return native.shareExport(id);
+}
+
+/** Removes a finished or partial export's private file. Never throws. */
+export async function discardExport(id: string): Promise<void> {
+    try { if (native?.discardExport) await native.discardExport(id); } catch { /* temporary folder is swept on launch */ }
+}
+
+/** Removes every export file (and closes the iOS share sheet), e.g. when the session ends. Never throws. */
+export async function discardAllExports(): Promise<void> {
+    try { if (native?.discardAllExports) await native.discardAllExports(); } catch { /* temporary folder is swept on launch */ }
 }
 
 export async function saveExportMessage(message: Extract<ExportMessage, { sequence: number }>): Promise<string | number | void> {
-    if (!native || typeof native.startExport !== 'function') throw new Error('Install the updated Android app to save exports');
+    if (!native || typeof native.startExport !== 'function') throw new Error('Install the latest version of the app to save exports');
     switch (message.type) {
         case 'export-start': return native.startExport(message.id, message.name, message.mime, message.size);
         case 'export-chunk': return native.appendExport(message.id, message.data);

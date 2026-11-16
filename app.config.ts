@@ -32,6 +32,30 @@ function loadRegistry(): unknown {
     throw new Error('No country registry found. Supply config/countries.local.json, config/countries.json, NEOTREE_COUNTRIES_FILE, or NEOTREE_COUNTRIES_JSON.');
 }
 
+/** Same rule as the runtime parser, applied at build time so a registry without host pinning never ships. */
+function assertAllowedHosts(registry: unknown): unknown {
+    const countries = (registry as { countries?: { code?: unknown; allowedHosts?: unknown; }[]; } | null)?.countries;
+    if (!Array.isArray(countries)) return registry;
+    const missing = countries
+        .filter(country => !Array.isArray(country?.allowedHosts) || !country.allowedHosts.some(host => typeof host === 'string' && host.trim()))
+        .map((country, index) => (typeof country?.code === 'string' ? country.code : `countries[${index}]`));
+    if (missing.length) {
+        throw new Error(`Country registry: allowedHosts must list the approved Superset host for ${missing.join(', ')}`);
+    }
+    return registry;
+}
+
+/** Optional diagnostics endpoint. Must be HTTPS (no credentials in the URL); checked so a typo fails the build. */
+function telemetryUrl(): string | undefined {
+    const value = process.env.NEOTREE_TELEMETRY_URL?.trim();
+    if (!value) return undefined;
+    let url: URL;
+    try { url = new URL(value); } catch { throw new Error('NEOTREE_TELEMETRY_URL is not a valid URL'); }
+    if (url.protocol !== 'https:') throw new Error('NEOTREE_TELEMETRY_URL must use HTTPS');
+    if (url.username || url.password) throw new Error('NEOTREE_TELEMETRY_URL must not contain credentials');
+    return url.href;
+}
+
 const FLAG_TYPES: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
 const MAX_FLAG_BYTES = 150 * 1024;
 
@@ -73,7 +97,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     name: 'Neotree Analytics',
     slug: 'neotree-analytics',
     scheme: 'neotree-analytics',
-    orientation: 'portrait',
+    // Every orientation is allowed here; src/lib/orientation.ts keeps phones in portrait at launch.
+    orientation: 'default',
     icon: './assets/icon.png',
     userInterfaceStyle: 'automatic',
     backgroundColor: '#FFFFFF',
@@ -128,9 +153,11 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
         ],
     ],
     extra: {
-        countryRegistry: withFlags(loadRegistry()),
+        countryRegistry: withFlags(assertAllowedHosts(loadRegistry())),
         // Internal feedback builds may opt in to screen recording. Keep release builds protected.
         allowScreenCapture: process.env.NEOTREE_ALLOW_SCREEN_CAPTURE === 'true',
+        // Diagnostics reporting (README "Diagnostics reporting"). Unset means nothing is stored or sent.
+        telemetryUrl: telemetryUrl(),
         ...(process.env.EAS_PROJECT_ID ? { eas: { projectId: process.env.EAS_PROJECT_ID } } : {}),
     },
 });

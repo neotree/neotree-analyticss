@@ -1,19 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, BackHandler, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { AppState, BackHandler, Modal, Pressable, StyleSheet, Text, ToastAndroid, useWindowDimensions, View } from 'react-native';
 import { useNetworkState } from 'expo-network';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { WebView, type WebViewMessageEvent, type WebViewNavigation, type WebViewProps } from 'react-native-webview';
 import type { ShouldStartLoadRequest, WebViewHttpErrorEvent } from 'react-native-webview/lib/WebViewTypes';
 
 import { ErrorView, LoadingCover, LoadingView, PrivacyCover } from '../components/Screens';
-import { Spinner } from '../components/Spinner';
+import { DownloadBanner, ExportBanner } from '../components/TransferBanners';
 import { useConfigSync } from '../hooks/useConfigSync';
+import { useDownloadTracker } from '../hooks/useDownloadTracker';
+import { useExports } from '../hooks/useExports';
 import { useInactivity } from '../hooks/useInactivity';
-import { abortExport, canTrackDownloads, downloadStatus, listDownloads, parseExportMessage, saveExportMessage, type AndroidDownload } from '../lib/downloads';
 import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, isFilterAppliedMessage, pageKey, pageKindFromUrl, readBusyLabel, readPageContext, readReadOnlyAddKind, readyPageUrl, shouldKeepDashboardVisible, type AnalyticsPageKind } from '../lib/injected';
-import { bestEffortLogout } from '../lib/logout';
 import type { ConfigStore, Country } from '../lib/types';
+import { report } from '../lib/telemetry';
 import { buildLandingUrl, isAuthoringDestination, isNavigationAllowed } from '../lib/validation';
+import { endWebSession } from '../lib/webSession';
 import { brand, useTheme } from '../theme';
 
 // react-native-webview's `WebView<P>` class declaration is circular under TypeScript 6, which makes its JSX
@@ -21,23 +23,30 @@ import { brand, useTheme } from '../theme';
 type WebViewHandle = InstanceType<typeof WebView>;
 const SupersetWebView = WebView as unknown as React.ComponentType<WebViewProps & { ref?: React.Ref<WebViewHandle>; }>;
 
+const MAX_TEXT_ZOOM = 1.3;
 type Props = {
     country: Country;
     store: ConfigStore;
     allowInsecure: boolean;
-    onSwitchCountry: () => void;
-    onLock: () => void;
+    /** Resolves true once the app has left this screen, false if the switch could not be saved. */
+    onSwitchCountry: () => boolean | Promise<boolean>;
+    onLock: () => boolean;
 };
-
-type ExportProgress = { id: string; name: string; status: 'preparing' | 'saving' | 'complete' | 'failed'; downloaded: number; total: number; error?: string };
 
 export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry, onLock }: Props) {
     const t = useTheme();
+    const { fontScale } = useWindowDimensions();
+    // Follow the system font size inside Superset, capped so its fitted desktop layout does not break.
+    const textZoom = Math.round(Math.min(Math.max(fontScale, 1), MAX_TEXT_ZOOM) * 100);
+    const [loadedAt, setLoadedAt] = useState<number | null>(null);
+    const lastBackPress = useRef(0);
     const network = useNetworkState();
     const offline = network.isConnected === false || network.isInternetReachable === false;
     const wasOffline = useRef(false);
     const { state, retry, refresh, recheck } = useConfigSync(country, store, allowInsecure);
     const webViewRef = useRef<WebViewHandle>(null);
+    const { download, dismissDownload, kickDownloadPolling } = useDownloadTracker();
+    const { exportProgress, exportElapsed, handleExportMessage, dismissExport, presentShare, discardAll, cancelPdfWait } = useExports(webViewRef);
     const canGoBack = useRef(false);
     const loadingUrl = useRef<string | null>(null);
     const readyPage = useRef<string | null>(null);
@@ -49,11 +58,9 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
     const [coverLabel, setCoverLabel] = useState('Loading…');
     const [reportedPage, setReportedPage] = useState<{ kind: AnalyticsPageKind; url: string } | null>(null);
     const [blockedHost, setBlockedHost] = useState<string | null>(null);
-    const [download, setDownload] = useState<AndroidDownload | null>(null);
-    const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
-    const [exportElapsed, setExportElapsed] = useState(0);
     const [readOnlyDialog, setReadOnlyDialog] = useState<'Chart' | 'Dashboard' | null>(null);
-    const seenDownloads = useRef<Set<string> | null>(null);
+    const endingSession = useRef(false);
+    const [signingOut, setSigningOut] = useState(false);
 
     const config = state.status === 'ready' ? state.config : null;
     const supersetUrl = config?.supersetUrl;
@@ -64,15 +71,17 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         readOnlyAlertAt.current = Date.now();
         setReadOnlyDialog(kind);
     }, []);
+
     const currentPageKind = reportedPage?.kind ?? pageKindFromUrl(
         loadingUrl.current ?? (supersetUrl ? buildLandingUrl(supersetUrl, country.landingPath) : null),
         country.landingPath,
     );
+    const lastUpdated = loadedAt ? ` Last updated ${new Date(loadedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.` : '';
     const offlineNotice = currentPageKind === 'sign-in'
         ? 'No internet connection. Connect to Wi-Fi or mobile data to sign in.'
         : currentPageKind === 'dashboard'
-            ? 'No internet connection. This dashboard may be out of date. It will stay open while you reconnect.'
-            : 'No internet connection. This page may be out of date. Reconnect to load new information.';
+            ? `No internet connection. This dashboard may be out of date. It will stay open while you reconnect.${lastUpdated}`
+            : `No internet connection. This page may be out of date. Reconnect to load new information.${lastUpdated}`;
     const offlinePageTitle = currentPageKind === 'sign-in' ? 'Sign-in unavailable offline'
         : currentPageKind === 'dashboard' ? 'Dashboard unavailable offline' : 'Analytics unavailable offline';
     const offlinePageMessage = currentPageKind === 'sign-in'
@@ -103,16 +112,45 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         }
     }, [offline, network.isConnected, network.isInternetReachable, state.status, pageError, pageReady, retry, refresh]);
 
-    const endSession = useCallback(async (then: () => void) => {
-        if (supersetUrl) bestEffortLogout(supersetUrl);
-        then();
-    }, [supersetUrl]);
+    // Unmount the WebView at once (the "Signing out…" view replaces it), then end the session before
+    // leaving. `then` reports whether the app moved on; if it did not (e.g. the country selection
+    // could not be saved), this screen returns to a fresh sign-in page instead of a stuck spinner.
+    const endSession = useCallback(async (then: () => boolean | Promise<boolean>) => {
+        if (endingSession.current) return;
+        endingSession.current = true;
+        setSigningOut(true);
+        let left = false;
+        try {
+            await discardAll();
+            await endWebSession(supersetUrl);
+            left = await then();
+        } finally {
+            if (!left) {
+                endingSession.current = false;
+                setReadySource(null);
+                setSigningOut(false);
+            }
+        }
+    }, [supersetUrl, discardAll]);
 
     const { covered, markActivity } = useInactivity({
         enabled: !!config,
         timeoutMinutes: config?.inactivityTimeoutMinutes ?? 15,
         onTimeout: () => { endSession(onLock); },
     });
+
+    // Top-bar Reload: re-mounts the page after an error, otherwise reloads it in place (Superset keeps
+    // the dashboard's filters in its URL).
+    const reloadPage = useCallback(() => {
+        markActivity();
+        if (pageError) {
+            setReadySource(null);
+            loadingUrl.current = null;
+            setPageError(null);
+        } else {
+            webViewRef.current?.reload();
+        }
+    }, [pageError, markActivity]);
 
     // Check Webeditor each time the app returns to the foreground.
     useEffect(() => {
@@ -123,14 +161,17 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         return () => sub.remove();
     }, [config, recheck]);
 
-    // Android back navigates inside Superset before leaving the app.
+    // Android back navigates inside Superset first; at the first page, a second press within 2 s leaves the app.
     useEffect(() => {
         const sub = BackHandler.addEventListener('hardwareBackPress', () => {
             if (canGoBack.current) {
                 webViewRef.current?.goBack();
                 return true;
             }
-            return false;
+            if (Date.now() - lastBackPress.current < 2_000) return false;
+            lastBackPress.current = Date.now();
+            ToastAndroid.show('Press back again to exit', ToastAndroid.SHORT);
+            return true;
         });
         return () => sub.remove();
     }, []);
@@ -147,49 +188,6 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         if (revealTimer.current) clearTimeout(revealTimer.current);
     }, []);
 
-    useEffect(() => {
-        if (exportProgress?.status !== 'preparing') return;
-        setExportElapsed(0);
-        const started = Date.now();
-        const timer = setInterval(() => setExportElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
-        return () => clearInterval(timer);
-    }, [exportProgress?.id, exportProgress?.status]);
-
-    // WebView queues HTTP attachments in Android DownloadManager. Poll this app's
-    // downloads so progress and completion appear in the app as well as Android's notification.
-    useEffect(() => {
-        if (!canTrackDownloads) return;
-        let cancelled = false;
-        let checking = false;
-        const check = async () => {
-            if (checking) return;
-            checking = true;
-            try {
-                const downloads = await listDownloads();
-                if (cancelled) return;
-                if (!seenDownloads.current) {
-                    seenDownloads.current = new Set(downloads.map(item => item.id));
-                    return;
-                }
-                const newest = downloads.filter(item => !seenDownloads.current!.has(item.id))
-                    .sort((a, b) => Number(b.id) - Number(a.id))[0];
-                if (newest) {
-                    seenDownloads.current.add(newest.id);
-                    setDownload(newest);
-                } else {
-                    setDownload(previous => previous && downloads.find(item => item.id === previous.id) || previous);
-                }
-            } catch {
-                // Android's own download notification remains available if status polling fails.
-            } finally {
-                checking = false;
-            }
-        };
-        void check();
-        const timer = setInterval(check, 1000);
-        return () => { cancelled = true; clearInterval(timer); };
-    }, []);
-
     // A stalled page load must never leave an opaque spinner over a usable WebView.
     useEffect(() => {
         if (!supersetUrl || pageReady || pageError || offline) return;
@@ -198,39 +196,11 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
     }, [supersetUrl, pageReady, pageError, offline]);
 
     const onMessage = useCallback((e: WebViewMessageEvent) => {
-        const exportMessage = parseExportMessage(e.nativeEvent.data);
-        if (exportMessage) {
-            if (exportMessage.type === 'export-prepare') {
-                setExportProgress({ id: exportMessage.id, name: exportMessage.name, status: 'preparing', downloaded: 0, total: 0 });
-            } else if (exportMessage.type === 'export-abort') {
-                void abortExport(exportMessage.id);
-                if (exportMessage.error === 'Cancelled') setExportProgress(null);
-                else setExportProgress(previous => previous?.id === exportMessage.id
-                    ? { ...previous, status: 'failed', error: exportMessage.error }
-                    : { id: exportMessage.id, name: exportMessage.name, status: 'failed', downloaded: 0, total: 0, error: exportMessage.error });
-            } else {
-                void (async () => {
-                    try {
-                        const result = await saveExportMessage(exportMessage);
-                        setExportProgress(previous => {
-                            if (!previous || previous.id !== exportMessage.id) return previous;
-                            if (exportMessage.type === 'export-start') return { ...previous, name: String(result || previous.name), status: 'saving', total: exportMessage.size };
-                            if (exportMessage.type === 'export-chunk') return { ...previous, downloaded: exportMessage.downloaded };
-                            return { ...previous, name: String(result || previous.name), status: 'complete', downloaded: previous.total };
-                        });
-                        webViewRef.current?.injectJavaScript(`window.__ntDownloadAck(${JSON.stringify(exportMessage.id)},${exportMessage.sequence},true);true;`);
-                    } catch (error) {
-                        void abortExport(exportMessage.id);
-                        setExportProgress(previous => previous?.id === exportMessage.id
-                            ? { ...previous, status: 'failed', error: error instanceof Error ? error.message : 'Could not save export' }
-                            : previous);
-                        webViewRef.current?.injectJavaScript(`window.__ntDownloadAck(${JSON.stringify(exportMessage.id)},${exportMessage.sequence},false,${JSON.stringify(error instanceof Error ? error.message : 'Could not save export')});true;`);
-                    }
-                })();
-            }
-            return;
+        if (handleExportMessage(e.nativeEvent.data)) return;
+        if (isActivityMessage(e.nativeEvent.data)) {
+            markActivity();
+            kickDownloadPolling();
         }
-        if (isActivityMessage(e.nativeEvent.data)) markActivity();
         if (isFilterAppliedMessage(e.nativeEvent.data)) filterAppliedAt.current = Date.now();
         const readOnlyKind = readReadOnlyAddKind(e.nativeEvent.data);
         if (readOnlyKind) explainReadOnly(readOnlyKind);
@@ -246,11 +216,14 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
             setReadySource(null);
         }
         if (isAnyPageReadyMessage(e.nativeEvent.data)) {
+            setLoadedAt(Date.now());
             readyPage.current = pageKey(readyPageUrl(e.nativeEvent.data));
             setReadySource(supersetUrl ?? null);
             setCoverLabel('Loading…');
         }
-    }, [markActivity, supersetUrl, pageReady, explainReadOnly, country.landingPath]);
+    }, [markActivity, supersetUrl, pageReady, explainReadOnly, country.landingPath, handleExportMessage, kickDownloadPolling]);
+
+    if (signingOut) return <LoadingView message="Signing out…" />;
 
     if (state.status === 'loading') return offline
         ? <ErrorView title="You're offline" message="Connect to Wi-Fi or mobile data. The app will try again when your connection returns." panel actions={[{ label: 'Try again', onPress: retry }, { label: 'Switch country', onPress: onSwitchCountry, secondary: true }]} />
@@ -275,14 +248,23 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
         <SafeAreaView edges={['top', 'bottom']} style={[styles.root, { backgroundColor: t.background }]}>
             <View style={[styles.bar, { backgroundColor: t.primary }]}>
                 <Text style={[styles.barTitle, { color: t.onPrimary }]} numberOfLines={1}>{country.name}</Text>
+                <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Reload page"
+                    onPress={reloadPage}
+                    hitSlop={12}
+                    style={({ pressed }) => [styles.barChip, styles.barChipSpacing, { borderColor: t.onPrimary }, pressed && { opacity: 0.7 }]}
+                >
+                    <Text style={[styles.barAction, { color: t.onPrimary }]}>Reload</Text>
+                </Pressable>
                 <Pressable accessibilityRole="button" onPress={() => endSession(onSwitchCountry)} hitSlop={12} style={({ pressed }) => [styles.barChip, { borderColor: t.onPrimary }, pressed && { opacity: 0.7 }]}>
                     <Text style={[styles.barAction, { color: t.onPrimary }]}>Switch country</Text>
                 </Pressable>
             </View>
 
             {offline && !pageError && pageReady && (
-                <View style={styles.offlineBanner}>
-                    <Text accessibilityRole="alert" style={styles.offlineText}>
+                <View style={[styles.offlineBanner, { backgroundColor: t.warningSurface }]}>
+                    <Text accessibilityRole="alert" style={[styles.offlineText, { color: t.onWarning }]}>
                         {offlineNotice}
                     </Text>
                 </View>
@@ -294,7 +276,7 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                         {state.usingSavedConfig ? 'Webeditor unavailable; using saved settings. Superset may still be accessible. ' : 'Configuration check failed: '}
                         {state.verifyError}
                     </Text>
-                    <Pressable accessibilityRole="button" onPress={refresh} hitSlop={12}>
+                    <Pressable accessibilityRole="button" accessibilityLabel="Retry configuration check" onPress={refresh} hitSlop={12}>
                         <Text style={styles.bannerAction}>Retry</Text>
                     </Pressable>
                 </View>
@@ -303,79 +285,22 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
             {!!blockedHost && (
                 <View style={[styles.banner, { backgroundColor: brand.navy }]}>
                     <Text style={styles.bannerText} numberOfLines={2}>Blocked navigation to {blockedHost}</Text>
-                    <Pressable accessibilityRole="button" onPress={() => setBlockedHost(null)} hitSlop={12}>
+                    <Pressable accessibilityRole="button" accessibilityLabel="Dismiss blocked navigation notice" onPress={() => setBlockedHost(null)} hitSlop={12}>
                         <Text style={styles.bannerAction}>Dismiss</Text>
                     </Pressable>
                 </View>
             )}
 
-            {!!download && (
-                <View style={[styles.downloadBanner, { backgroundColor: t.surface, borderColor: t.border }]}>
-                    {downloadStatus(download) === 'active' && <Spinner size={25} />}
-                    <View style={styles.downloadDetails}>
-                        <Text style={[styles.downloadTitle, { color: t.text }]} numberOfLines={1}>
-                            {downloadStatus(download) === 'complete' ? 'Download complete' : downloadStatus(download) === 'failed' ? 'Download failed' : 'Downloading…'}
-                        </Text>
-                        <Text style={[styles.downloadSubtitle, { color: t.muted }]} numberOfLines={2}>
-                            {downloadStatus(download) === 'complete'
-                                ? `Saved to Downloads/${download.name}`
-                                : downloadStatus(download) === 'failed'
-                                    ? download.name
-                                    : download.total > 0
-                                        ? download.name
-                                        : `${download.name} · waiting for file size`}
-                        </Text>
-                        {downloadStatus(download) === 'active' && download.total > 0 && (
-                            <View style={[styles.downloadTrack, { backgroundColor: t.border }]}>
-                                <View style={[styles.downloadFill, { backgroundColor: t.primary, width: `${Math.min(100, Math.max(0, download.downloaded / download.total * 100))}%` }]} />
-                            </View>
-                        )}
-                    </View>
-                    {downloadStatus(download) === 'active' && download.total > 0 && (
-                        <Text style={[styles.progressValue, { color: t.primary }]}>{Math.min(100, Math.round(download.downloaded / download.total * 100))}%</Text>
-                    )}
-                    {downloadStatus(download) !== 'active' && (
-                        <Pressable accessibilityRole="button" onPress={() => setDownload(null)} hitSlop={12}>
-                            <Text style={[styles.downloadDismiss, { color: t.primary }]}>Dismiss</Text>
-                        </Pressable>
-                    )}
-                </View>
-            )}
+            {!!download && <DownloadBanner download={download} onDismiss={dismissDownload} />}
 
             {!!exportProgress && (
-                <View style={[styles.downloadBanner, { backgroundColor: t.surface, borderColor: t.border }]}>
-                    {(exportProgress.status === 'preparing' || exportProgress.status === 'saving') && <Spinner size={25} />}
-                    <View style={styles.downloadDetails}>
-                        <Text style={[styles.downloadTitle, { color: t.text }]} numberOfLines={1}>
-                            {exportProgress.status === 'complete' ? 'Export complete' : exportProgress.status === 'failed' ? 'Export failed' : exportProgress.status === 'preparing' ? 'Preparing export…' : 'Saving export…'}
-                        </Text>
-                        <Text style={[styles.downloadSubtitle, { color: t.muted }]} numberOfLines={2}>
-                            {exportProgress.status === 'complete' ? `Saved to Downloads/${exportProgress.name}`
-                                : exportProgress.status === 'failed' ? exportProgress.error || 'Could not save the file'
-                                : exportProgress.status === 'saving' && exportProgress.total > 0
-                                    ? exportProgress.name
-                                    : `${exportProgress.name} · ${exportElapsed}s`}
-                        </Text>
-                        {exportProgress.status === 'saving' && exportProgress.total > 0 && (
-                            <View style={[styles.downloadTrack, { backgroundColor: t.border }]}>
-                                <View style={[styles.downloadFill, { backgroundColor: t.primary, width: `${Math.min(100, Math.max(0, exportProgress.downloaded / exportProgress.total * 100))}%` }]} />
-                            </View>
-                        )}
-                    </View>
-                    {exportProgress.status === 'saving' && exportProgress.total > 0 && (
-                        <Text style={[styles.progressValue, { color: t.primary }]}>{Math.min(100, Math.round(exportProgress.downloaded / exportProgress.total * 100))}%</Text>
-                    )}
-                    {(exportProgress.status === 'complete' || exportProgress.status === 'failed') && (
-                        <Pressable accessibilityRole="button" onPress={() => setExportProgress(null)} hitSlop={12}>
-                            <Text style={[styles.downloadDismiss, { color: t.primary }]}>Dismiss</Text>
-                        </Pressable>
-                    )}
-                    {exportProgress.status === 'preparing' && exportProgress.name === 'Preparing dashboard PDF' && (
-                        <Pressable accessibilityRole="button" onPress={() => webViewRef.current?.injectJavaScript('window.__ntCancelPdfWait && window.__ntCancelPdfWait();true;')} hitSlop={12}>
-                            <Text style={[styles.downloadDismiss, { color: t.primary }]}>Cancel</Text>
-                        </Pressable>
-                    )}
-                </View>
+                <ExportBanner
+                    progress={exportProgress}
+                    elapsed={exportElapsed}
+                    onSave={() => void presentShare(exportProgress.id)}
+                    onDismiss={dismissExport}
+                    onCancelPdf={cancelPdfWait}
+                />
             )}
 
             <View style={[styles.webWrap, currentPageKind !== 'sign-in' && styles.webSpacing]}>
@@ -415,6 +340,11 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                             // a backstop for a page whose bridge is blocked, so it is deliberately late.
                             if (!offline) revealTimer.current = setTimeout(() => setReadySource(supersetUrl ?? null), 10_000);
                         }}
+                        // iOS only: an attachment response (e.g. CSV) is cancelled by the WebView and reported here.
+                        // Re-fetch it inside the page, with its session, and save it through the export bridge.
+                        onFileDownload={e => {
+                            webViewRef.current?.injectJavaScript(`window.__ntTransferExport && window.__ntTransferExport(${JSON.stringify(e.nativeEvent.downloadUrl)});true;`);
+                        }}
                         onNavigationStateChange={(nav: WebViewNavigation) => {
                             canGoBack.current = nav.canGoBack;
                         }}
@@ -425,18 +355,27 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                                 else if (/\/dashboard\/new(?:\/|$)/i.test(new URL(req.url).pathname)) explainReadOnly('Dashboard');
                                 return false;
                             }
-                            if (isNavigationAllowed(req.url, supersetUrl!, country.allowedHosts, { allowInsecure })) return true;
-                            try { setBlockedHost(new URL(req.url).hostname || req.url); } catch { setBlockedHost('an unknown destination'); }
+                            if (isNavigationAllowed(req.url, supersetUrl!, country.allowedHosts, { allowInsecure })) {
+                                // A link may turn out to be a file download handed to DownloadManager.
+                                kickDownloadPolling();
+                                return true;
+                            }
+                            let host = 'an unknown destination';
+                            try { host = new URL(req.url).hostname || host; } catch { /* keep the generic label */ }
+                            setBlockedHost(host);
+                            report('navigation-blocked', 'Navigation outside the approved hosts', { host });
                             return false;
                         }}
                         onError={() => {
                             if (revealTimer.current) clearTimeout(revealTimer.current);
                             if (offline && pageReady) return;
+                            if (!offline) report('page-error', 'Superset page failed to load', { network: true });
                             setPageError('Superset is not accessible. Check your connection or try again later.');
                         }}
                         onHttpError={(e: WebViewHttpErrorEvent) => {
                             if (e.nativeEvent.statusCode >= 400) {
-                                    if (revealTimer.current) clearTimeout(revealTimer.current);
+                                if (revealTimer.current) clearTimeout(revealTimer.current);
+                                report('page-error', `Superset returned HTTP ${e.nativeEvent.statusCode}`, { status: e.nativeEvent.statusCode });
                                 setPageError(`Superset returned HTTP ${e.nativeEvent.statusCode}. Please try again or contact your administrator.`);
                             }
                         }}
@@ -453,7 +392,7 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                         allowsLinkPreview={false}
                         mixedContentMode="never"
                         webviewDebuggingEnabled={false}
-                        textZoom={100}
+                        textZoom={textZoom}
                         // Allow deliberate pinch zoom; the page CSS keeps small filter fields readable.
                         setBuiltInZoomControls
                         setDisplayZoomControls={false}
@@ -487,7 +426,7 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                 <View style={styles.dialogBackdrop}>
                     <Pressable style={StyleSheet.absoluteFill} onPress={() => setReadOnlyDialog(null)} accessibilityLabel="Close notice" />
                     <View style={[styles.dialogCard, { backgroundColor: t.surface }]}>
-                        <View style={[styles.dialogIcon, { backgroundColor: '#E8F3ED' }]}>
+                        <View style={[styles.dialogIcon, { backgroundColor: t.primarySoft }]}>
                             <Text style={[styles.dialogIconText, { color: t.primary }]}>i</Text>
                         </View>
                         <Text style={[styles.dialogTitle, { color: t.text }]}>View only on mobile</Text>
@@ -497,7 +436,7 @@ export function AnalyticsScreen({ country, store, allowInsecure, onSwitchCountry
                                 : 'You can view dashboards here. To add a dashboard, open Superset on a computer.'}
                         </Text>
                         <Pressable accessibilityRole="button" onPress={() => setReadOnlyDialog(null)} style={[styles.dialogButton, { backgroundColor: t.primary }]}>
-                            <Text style={styles.dialogButtonText}>Got it</Text>
+                            <Text style={[styles.dialogButtonText, { color: t.onPrimary }]}>Got it</Text>
                         </Pressable>
                     </View>
                 </View>
@@ -511,22 +450,15 @@ const styles = StyleSheet.create({
     bar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 6 },
     barTitle: { fontSize: 15, fontWeight: '700', flex: 1, marginRight: 12 },
     barChip: { borderWidth: 1, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 4 },
+    barChipSpacing: { marginRight: 8 },
     barAction: { fontSize: 12, fontWeight: '600' },
     banner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 8, gap: 12 },
     bannerText: { color: '#FFFFFF', fontSize: 13, flex: 1 },
     bannerAction: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', textDecorationLine: 'underline' },
-    offlineBanner: { backgroundColor: '#F8EBC4', paddingHorizontal: 16, paddingVertical: 10 },
-    offlineText: { color: brand.navy, fontSize: 13, lineHeight: 18 },
+    offlineBanner: { paddingHorizontal: 16, paddingVertical: 10 },
+    offlineText: { fontSize: 13, lineHeight: 18 },
     webWrap: { flex: 1 },
     webSpacing: { marginTop: 12 },
-    downloadBanner: { borderBottomWidth: 1, paddingHorizontal: 14, paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 12 },
-    downloadDetails: { flex: 1 },
-    downloadTitle: { fontSize: 14, fontWeight: '700' },
-    downloadSubtitle: { fontSize: 12, marginTop: 2 },
-    downloadTrack: { height: 4, borderRadius: 2, marginTop: 6, overflow: 'hidden' },
-    downloadFill: { height: 4, borderRadius: 2 },
-    downloadDismiss: { fontSize: 12, fontWeight: '700' },
-    progressValue: { fontSize: 16, fontWeight: '800', minWidth: 44, textAlign: 'right' },
     dialogBackdrop: { flex: 1, backgroundColor: 'rgba(20, 38, 30, .45)', alignItems: 'center', justifyContent: 'center', padding: 24 },
     dialogCard: { width: '100%', maxWidth: 380, borderRadius: 20, padding: 24, alignItems: 'center', elevation: 8 },
     dialogIcon: { width: 46, height: 46, borderRadius: 23, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
@@ -534,5 +466,5 @@ const styles = StyleSheet.create({
     dialogTitle: { fontSize: 19, fontWeight: '700', textAlign: 'center' },
     dialogMessage: { fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 10, marginBottom: 22 },
     dialogButton: { minHeight: 46, width: '100%', borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-    dialogButtonText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700' },
+    dialogButtonText: { fontSize: 15, fontWeight: '700' },
 });

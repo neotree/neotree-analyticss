@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Expo SDK packages must move together (use `npx expo install --fix`), so Expo and React Native
+  # majors are left to a deliberate SDK upgrade; Dependabot proposes patch/minor updates only.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      expo-sdk:
+        patterns: ['expo', 'expo-*', '@expo/*', 'react-native', 'react-native-*', 'react', '@types/react']
+        update-types: [minor, patch]
+      tooling:
+        patterns: ['typescript', 'tsx', '@types/*']
+    ignore:
+      - dependency-name: 'expo*'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'react-native*'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'react'
+        update-types: ['version-update:semver-major']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

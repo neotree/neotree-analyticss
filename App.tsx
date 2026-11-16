@@ -11,6 +11,10 @@ import { ErrorView, LoadingView } from './src/components/Screens';
 import type { ConfigStore, Country } from './src/lib/types';
 import { AnalyticsScreen } from './src/screens/AnalyticsScreen';
 import { CountrySelectScreen } from './src/screens/CountrySelectScreen';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
+import { applyOrientationPolicy } from './src/lib/orientation';
+import { report, setTelemetryCountry } from './src/lib/telemetry';
+import { clearWebSession } from './src/lib/webSession';
 
 type Boot =
     | { status: 'loading'; }
@@ -33,6 +37,11 @@ export default function App() {
             return { error: (e as Error).message };
         }
     }, []);
+
+    useEffect(() => { void applyOrientationPolicy(); }, []);
+
+    const selectedCountry = boot.status === 'ready' ? boot.selected : null;
+    useEffect(() => { setTelemetryCountry(selectedCountry); }, [selectedCountry]);
 
     // Sensitive health analytics: block screenshots and the recents thumbnail unless explicitly allowed.
     useEffect(() => {
@@ -68,26 +77,33 @@ export default function App() {
         let cancelled = false;
         (async () => {
             try {
+                // A session left behind by a killed app must not sit on disk until the next WebView mount.
+                await clearWebSession();
                 const store = await openConfigStore();
                 const selected = await store.getSelectedCountry();
                 if (!cancelled) setBoot({ status: 'ready', store, selected });
             } catch (e) {
+                report('js-error', e, { stage: 'open-config-database' });
                 if (!cancelled) setBoot({ status: 'error', message: `The local configuration database could not be opened: ${(e as Error)?.message || 'Unknown error'}` });
             }
         })();
         return () => { cancelled = true; };
     }, [bootAttempt]);
 
-    const select = useCallback(async (country: Country | null) => {
-        if (boot.status !== 'ready' || savingSelection) return;
+    // Resolves true when the selection was saved and the screen changed.
+    const select = useCallback(async (country: Country | null): Promise<boolean> => {
+        if (boot.status !== 'ready' || savingSelection) return false;
         setSavingSelection(true);
         setSelectionError(null);
         try {
             await boot.store.setSelectedCountry(country?.code ?? null);
             setLocked(false);
-            setBoot({ ...boot, selected: country?.code ?? null });
+            // Functional update: never write back a stale copy of the boot state.
+            setBoot(current => (current.status === 'ready' ? { ...current, selected: country?.code ?? null } : current));
+            return true;
         } catch (e) {
             setSelectionError(`Could not save your country selection: ${(e as Error)?.message || 'Unknown error'}`);
+            return false;
         } finally {
             setSavingSelection(false);
         }
@@ -135,7 +151,7 @@ export default function App() {
                     store={boot.store}
                     allowInsecure={ALLOW_INSECURE}
                     onSwitchCountry={() => select(null)}
-                    onLock={() => setLocked(true)}
+                    onLock={() => { setLocked(true); return true; }}
                 />
             );
         }
@@ -144,7 +160,7 @@ export default function App() {
     return (
         <SafeAreaProvider>
             <StatusBar style="auto" />
-            {content}
+            <ErrorBoundary>{content}</ErrorBoundary>
             {!!selectionError && boot.status === 'ready' && boot.selected && (
                 <View style={styles.errorBanner}>
                     <Text accessibilityRole="alert" style={styles.errorText}>{selectionError}</Text>

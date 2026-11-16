@@ -2,7 +2,12 @@ import type { Country } from './types';
 
 export const DEFAULT_LANDING_PATH = '/login/';
 
-const HOST_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/;
+const HOST_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[1-9][0-9]{0,4})?$/;
+
+function validPort(host: string) {
+    const port = host.split(':')[1];
+    return port === undefined || (Number(port) <= 65535 && port !== '443');
+}
 
 function parseBaseUrl(value: unknown, label: string, allowInsecure: boolean): string {
     if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} is required`);
@@ -68,9 +73,16 @@ export function parseCountryRegistry(raw: unknown, opts: { allowInsecure: boolea
 
         const allowedHosts = (Array.isArray(item.allowedHosts) ? item.allowedHosts : []).map((h: unknown) => {
             const host = typeof h === 'string' ? h.trim().toLowerCase() : '';
-            if (!HOST_PATTERN.test(host)) throw new Error(`${label}.allowedHosts contains an invalid host`);
+            if (!HOST_PATTERN.test(host) || !validPort(host)) {
+                throw new Error(`${label}.allowedHosts contains an invalid host "${host}" (use a hostname, optionally with :port, e.g. "analytics.example.org:8443")`);
+            }
             return host;
         });
+        // The Superset URL comes from the Webeditor at runtime. Without an allowlist a compromised or
+        // misconfigured Webeditor could point this address-bar-less WebView at any HTTPS sign-in page.
+        if (!allowedHosts.length) {
+            throw new Error(`${label}.allowedHosts must list the approved Superset host (e.g. "analytics.example.org" or "*.example.org")`);
+        }
 
         return {
             code,

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createRemoteApi } from '../lib/api';
 import { resolveConfig, SyncError } from '../lib/sync';
 import type { ConfigStore, Country, RemoteConfig } from '../lib/types';
+import { report } from '../lib/telemetry';
 import { validateRemoteConfig } from '../lib/validation';
 
 export type SyncState =
@@ -66,6 +67,7 @@ export function useConfigSync(country: Country, store: ConfigStore, allowInsecur
                 const message = (e as Error)?.message || 'Could not verify configuration.';
                 const supportCode = e instanceof SyncError ? e.supportCode : undefined;
                 const title = e instanceof SyncError ? 'Webeditor configuration unavailable' : 'Configuration unavailable';
+                report('config-error', message, { supportCode: supportCode ?? null, background, recoverable: e instanceof SyncError && e.recoverable });
                 setState(prev => (background && prev.status === 'ready'
                     ? { ...prev, verifyError: message }
                     : { status: 'error', title, message, supportCode }));

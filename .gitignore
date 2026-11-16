@@ -43,6 +43,7 @@ credentials.json
 /ios
 /android
 modules/neotree-downloads/android/build/
+modules/neotree-downloads/android/.gradle/
 
 # country registry holds Webeditor endpoints and analytics keys: never commit real values
 config/*

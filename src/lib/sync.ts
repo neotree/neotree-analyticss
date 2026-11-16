@@ -8,6 +8,12 @@ export class SyncError extends Error {
     }
 }
 
+/**
+ * Safety net for a Webeditor change saved without a version bump: even when the version matches,
+ * the full configuration is downloaded again once it is this old.
+ */
+export const FULL_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 export type RemoteApi = {
     fetchVersion(country: Country): Promise<unknown>;
     fetchConfig(country: Country): Promise<unknown>;
@@ -17,14 +23,15 @@ export type RemoteApi = {
  * The version-check flow from the requirements:
  *  - ask the Webeditor for versionNumber;
  *  - same as the (valid) cached one => keep the cache, no full-config fetch;
- *  - different or missing => fetch + validate the full config.
+ *  - different or missing => fetch + validate the full config;
+ *  - same, but the saved config is older than FULL_REFRESH_INTERVAL_MS => fetch it anyway.
  * If Webeditor is temporarily unavailable, a valid saved configuration can still open Superset.
  */
 export async function resolveConfig(
     country: Country,
     local: StoredConfig | null,
     api: RemoteApi,
-    opts: { allowInsecure: boolean; },
+    opts: { allowInsecure: boolean; now?: number; },
 ): Promise<{ config: RemoteConfig; fetched: boolean; verified: boolean; warning?: string; }> {
     const cached = local && validateRemoteConfig(local, country, opts);
     const cachedConfig = cached?.ok && local?.webeditorUrl === country.webeditorUrl ? cached.value : null;
@@ -33,7 +40,9 @@ export async function resolveConfig(
         const version = validateVersion(((await api.fetchVersion(country)) as any)?.versionNumber);
         if (!version.ok) throw new SyncError(version.error);
 
-        if (cachedConfig && cachedConfig.versionNumber === version.value) {
+        const now = opts.now ?? Date.now();
+        const fresh = local?.fetchedAt != null && now - local.fetchedAt >= 0 && now - local.fetchedAt < FULL_REFRESH_INTERVAL_MS;
+        if (cachedConfig && cachedConfig.versionNumber === version.value && fresh) {
             return { config: cachedConfig, fetched: false, verified: true };
         }
 

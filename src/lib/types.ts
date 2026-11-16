@@ -9,7 +9,10 @@ export type Country = {
     apiKey?: string;
     /** Landing path opened inside Superset. Owned by the app, never by the Webeditor. */
     landingPath: string;
-    /** Extra hosts the WebView may visit (e.g. an SSO provider). The Superset host is always allowed. */
+    /**
+     * Required, non-empty. The Superset URL from the Webeditor must match one of these hosts, and the WebView
+     * may also visit them (e.g. an SSO provider).
+     */
     allowedHosts: string[];
 };
 
@@ -23,6 +26,8 @@ export type RemoteConfig = {
 export type StoredConfig = RemoteConfig & {
     countryCode: string;
     lastCheckedAt: number | null;
+    /** When the full configuration was last downloaded. Null for rows saved before this was tracked. */
+    fetchedAt: number | null;
     /** Webeditor that supplied this record. Null means a cache row from before source tracking. */
     webeditorUrl: string | null;
 };

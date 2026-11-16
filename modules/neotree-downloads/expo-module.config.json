@@ -1,6 +1,9 @@
 {
-  "platforms": ["android"],
+  "platforms": ["android", "apple"],
   "android": {
     "modules": ["app.neotree.downloads.NeotreeDownloadsModule"]
+  },
+  "apple": {
+    "modules": ["NeotreeDownloadsModule"]
   }
 }

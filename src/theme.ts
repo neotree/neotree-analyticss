@@ -19,5 +19,15 @@ export function useTheme() {
         primary: brand.green,
         onPrimary: brand.cream,
         danger: '#B3261E',
+        onDanger: '#FFFFFF',
+        /** Raised cards and the selected list row. */
+        card: dark ? '#1E242E' : '#FFFFFF',
+        selectedSurface: dark ? '#18281F' : '#F1F8F4',
+        /** Soft brand tint, e.g. behind an icon. */
+        primarySoft: dark ? '#1F3A2C' : '#E8F3ED',
+        radioBorder: dark ? '#4B5563' : '#C5CDD3',
+        /** Offline / caution banners. */
+        warningSurface: dark ? '#4A3F1C' : '#F8EBC4',
+        onWarning: dark ? brand.cream : brand.navy,
     };
 }

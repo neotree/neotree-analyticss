@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 
 import { createRemoteApi } from '../src/lib/api';
+import { parseExportMessage } from '../src/lib/exportMessages';
+import { createReporter, parseTelemetryUrl, scrubText, type TelemetryEvent } from '../src/lib/telemetryCore';
 import { buildInjectedScript, isActivityMessage, isAnyPageReadyMessage, isFilterAppliedMessage, isPageReadyMessage, pageKey, pageKindFromUrl, readBusyLabel, readPageContext, readReadOnlyAddKind, readyPageUrl, shouldKeepDashboardVisible } from '../src/lib/injected';
 import { parseCountryRegistry } from '../src/lib/registry';
 import { resolveConfig, SyncError } from '../src/lib/sync';
@@ -9,7 +11,7 @@ import type { Country, StoredConfig } from '../src/lib/types';
 import { buildLandingUrl, hostMatches, isAuthoringDestination, isNavigationAllowed, validateRemoteConfig } from '../src/lib/validation';
 
 const strict = { allowInsecure: false };
-const country: Country = { code: 'ZW', name: 'Zimbabwe', webeditorUrl: 'https://we.example.org', apiKey: 'k', landingPath: '/login/', allowedHosts: [] };
+const country: Country = { code: 'ZW', name: 'Zimbabwe', webeditorUrl: 'https://we.example.org', apiKey: 'k', landingPath: '/login/', allowedHosts: ['*.example.org'] };
 const good = { supersetUrl: 'https://ss.example.org/', inactivityTimeoutMinutes: 15, versionNumber: 3 };
 
 async function main() {
@@ -20,7 +22,7 @@ async function main() {
     assert.equal(reg[0].landingPath, '/login/');
     assert.deepEqual(reg[0].allowedHosts, ['*.example.org']);
     {
-        const base = { code: 'zw', name: 'Zimbabwe', webeditorUrl: 'https://we.example.org' };
+        const base = { code: 'zw', name: 'Zimbabwe', webeditorUrl: 'https://we.example.org', allowedHosts: ['ss.example.org'] };
         const png = 'data:image/png;base64,iVBORw0KGgo=';
         assert.equal(parseCountryRegistry({ countries: [{ ...base, flag: png }] }, strict)[0].flag, png);
         assert.equal(parseCountryRegistry({ countries: [{ ...base, flag: 'https://cdn.example.org/zw.png' }] }, strict)[0].flag, 'https://cdn.example.org/zw.png');
@@ -30,12 +32,15 @@ async function main() {
         }
     }
     assert.throws(() => parseCountryRegistry({ countries: [] }, strict));
-    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'http://x.org' }] }, strict), /HTTPS/);
-    assert.doesNotThrow(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'http://10.0.2.2:3000' }] }, { allowInsecure: true }));
-    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://u:p@x.org' }] }, strict), /credentials/);
-    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org' }, { code: 'a', name: 'B', webeditorUrl: 'https://y.org' }] }, strict), /duplicated/);
-    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', landingPath: '//evil.org' }] }, strict));
+    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'http://x.org', allowedHosts: ['x.org'] }] }, strict), /HTTPS/);
+    assert.doesNotThrow(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'http://10.0.2.2:3000', allowedHosts: ['x.org'] }] }, { allowInsecure: true }));
+    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://u:p@x.org', allowedHosts: ['x.org'] }] }, strict), /credentials/);
+    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', allowedHosts: ['x.org'] }, { code: 'a', name: 'B', webeditorUrl: 'https://y.org', allowedHosts: ['x.org'] }] }, strict), /duplicated/);
+    assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', landingPath: '//evil.org', allowedHosts: ['x.org'] }] }, strict));
     assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', allowedHosts: ['bad host'] }] }, strict));
+    for (const hosts of [undefined, [], 'ss.example.org']) {
+        assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', allowedHosts: hosts }] }, strict), /allowedHosts must list/, String(hosts));
+    }
 
     // --- config validation
     const ok = validateRemoteConfig(good, country, strict);
@@ -52,14 +57,31 @@ async function main() {
         null,
     ]) assert.equal(validateRemoteConfig(bad, country, strict).ok, false, JSON.stringify(bad));
     assert.equal(validateRemoteConfig({ ...good, supersetUrl: 'http://ss.example.org' }, country, { allowInsecure: true }).ok, true);
+    assert.equal(validateRemoteConfig(good, { ...country, allowedHosts: [] }, strict).ok, false, 'an empty allowlist approves nothing');
+    assert.equal(validateRemoteConfig({ ...good, supersetUrl: 'https://phish.org' }, country, strict).ok, false);
     const pinned: Country = { ...country, allowedHosts: ['ss.example.org'] };
     assert.equal(validateRemoteConfig(good, pinned, strict).ok, true);
     assert.equal(validateRemoteConfig({ ...good, supersetUrl: 'https://evil.org' }, pinned, strict).ok, false);
 
     // --- hosts / navigation
-    assert.equal(hostMatches('a.example.org', ['*.example.org']), true);
-    assert.equal(hostMatches('example.org', ['*.example.org']), false);
-    assert.equal(hostMatches('evilexample.org', ['*.example.org']), false);
+    assert.equal(hostMatches(new URL('https://a.example.org'), ['*.example.org']), true);
+    assert.equal(hostMatches(new URL('https://example.org'), ['*.example.org']), false);
+    assert.equal(hostMatches(new URL('https://evilexample.org'), ['*.example.org']), false);
+    // Ports: an entry without one approves the default port only; with one, that port only.
+    assert.equal(hostMatches(new URL('https://ss.example.org:443/'), ['ss.example.org']), true);
+    assert.equal(hostMatches(new URL('https://ss.example.org:10243/'), ['ss.example.org']), false);
+    assert.equal(hostMatches(new URL('https://ss.example.org:10243/'), ['ss.example.org:10243']), true);
+    assert.equal(hostMatches(new URL('https://ss.example.org/'), ['ss.example.org:10243']), false);
+    assert.equal(hostMatches(new URL('https://ss.example.org:8443/'), ['ss.example.org:10243']), false);
+    const ported: Country = { ...country, allowedHosts: ['ss.example.org:10243'] };
+    const portedOk = validateRemoteConfig({ ...good, supersetUrl: 'https://ss.example.org:10243/' }, ported, strict);
+    assert.ok(portedOk.ok && portedOk.value.supersetUrl === 'https://ss.example.org:10243', 'the port is kept in the Superset URL');
+    assert.equal(validateRemoteConfig({ ...good, supersetUrl: 'https://ss.example.org:9999/' }, ported, strict).ok, false);
+    assert.equal(validateRemoteConfig({ ...good, supersetUrl: 'https://ss.example.org:10243/' }, pinned, strict).ok, false, 'an unlisted port is refused');
+    assert.deepEqual(parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', allowedHosts: ['X.org:10243'] }] }, strict)[0].allowedHosts, ['x.org:10243']);
+    for (const bad of ['x.org:0', 'x.org:70000', 'x.org:443', 'x.org:', 'https://x.org', 'x.org/']) {
+        assert.throws(() => parseCountryRegistry({ countries: [{ code: 'A', name: 'A', webeditorUrl: 'https://x.org', allowedHosts: [bad] }] }, strict), /invalid host/, bad);
+    }
     const nav = (u: string, hosts: string[] = []) => isNavigationAllowed(u, 'https://ss.example.org', hosts, strict);
     assert.equal(nav('https://ss.example.org/superset/welcome'), true);
     assert.equal(nav('https://SS.example.org/x'), true);
@@ -75,6 +97,8 @@ async function main() {
     assert.equal(nav('https://ss.example.org.evil.org/'), false);
     assert.equal(nav('https://sso.idp.org/', ['sso.idp.org']), true);
     assert.equal(nav('https://sso.idp.org:8443/', ['sso.idp.org']), false);
+    assert.equal(nav('https://sso.idp.org:8443/', ['sso.idp.org:8443']), true);
+    assert.equal(isNavigationAllowed('https://zim.example.org:10243/superset/', 'https://zim.example.org:10243', ['zim.example.org:10243'], strict), true);
     assert.equal(isAuthoringDestination('https://ss.example.org/chart/add', good.supersetUrl), true);
     assert.equal(isAuthoringDestination('https://ss.example.org/dashboard/new/', good.supersetUrl), true);
     assert.equal(isAuthoringDestination('https://ss.example.org/dashboard/import/', good.supersetUrl), true);
@@ -84,7 +108,7 @@ async function main() {
 
     // --- version sync: cache vs fetch
     let configCalls = 0;
-    const stored: StoredConfig = { ...good, supersetUrl: 'https://ss.example.org', countryCode: 'ZW', lastCheckedAt: 1, webeditorUrl: country.webeditorUrl };
+    const stored: StoredConfig = { ...good, supersetUrl: 'https://ss.example.org', countryCode: 'ZW', lastCheckedAt: 1, webeditorUrl: country.webeditorUrl, fetchedAt: Date.now() };
     const apiWith = (version: unknown, config: unknown = good) => ({
         fetchVersion: async () => ({ versionNumber: version }),
         fetchConfig: async () => { configCalls++; return config; },
@@ -94,6 +118,23 @@ async function main() {
     assert.equal(r.fetched, false);
     assert.equal(r.verified, true);
     assert.equal(configCalls, 0, 'identical version must not trigger a full-config fetch');
+    {
+        const day = 24 * 60 * 60 * 1000;
+        const now = Date.now();
+        const edited = { ...good, inactivityTimeoutMinutes: 45 };
+        r = await resolveConfig(country, { ...stored, fetchedAt: now - day - 1 }, apiWith(3, edited), { ...strict, now });
+        assert.equal(r.fetched, true, 'a day-old config is downloaded again even without a version bump');
+        assert.equal(r.config.inactivityTimeoutMinutes, 45);
+        r = await resolveConfig(country, { ...stored, fetchedAt: now - day + 60_000 }, apiWith(3, edited), { ...strict, now });
+        assert.equal(r.fetched, false, 'a config younger than a day is kept');
+        r = await resolveConfig(country, { ...stored, fetchedAt: null }, apiWith(3, edited), { ...strict, now });
+        assert.equal(r.fetched, true, 'rows from before refresh tracking are downloaded once');
+        r = await resolveConfig(country, { ...stored, fetchedAt: now + day }, apiWith(3, edited), { ...strict, now });
+        assert.equal(r.fetched, true, 'a fetch time in the future (clock changed) is treated as stale');
+        const offline = { fetchVersion: async () => ({ versionNumber: 3 }), fetchConfig: async () => { throw new SyncError('Webeditor offline', undefined, true); } };
+        r = await resolveConfig(country, { ...stored, fetchedAt: now - day - 1 }, offline, { ...strict, now });
+        assert.equal(r.config.supersetUrl, stored.supersetUrl, 'a failed refresh keeps the saved configuration');
+    }
 
     const changedEditor = { ...country, webeditorUrl: 'https://other-we.example.org' };
     r = await resolveConfig(changedEditor, stored, apiWith(3, { ...good, supersetUrl: 'https://new-ss.example.org/' }), strict);
@@ -389,6 +430,98 @@ async function main() {
     assert.equal(readyPageUrl('{"type":"page-ready","url":"https://a.b/c"}'), 'https://a.b/c');
     assert.equal(readyPageUrl('{"type":"activity"}'), null);
     assert.doesNotThrow(() => new Function(buildInjectedScript({ landingPathname: '/a"b', supersetOrigin: 'https://ss.example.org";alert(1);//' })));
+
+    // --- export menu labels (Superset 6.1.0, English): one table drives every export decision
+    {
+        const block = /var NT_LABELS = (\{[\s\S]*?\n\s*\});/.exec(script);
+        assert.ok(block, 'NT_LABELS table is present in the injected script');
+        const labels = vm.runInNewContext(`(${block![1]})`) as Record<'pdf' | 'image' | 'file', RegExp>;
+        for (const label of ['Export to PDF', 'export as pdf', 'Export to .PDF']) assert.ok(labels.pdf.test(label), label);
+        for (const label of ['Download as Image', 'Download as an image']) assert.ok(labels.image.test(label), label);
+        for (const label of ['Export to .CSV', 'Export to full .CSV', 'Export to Excel', 'Download as CSV', 'Export to .XLSX', 'Export screenshot (jpeg)', 'Export YAML', 'Export to PDF', 'Download as Image'])
+            assert.ok(labels.file.test(label), label);
+        for (const label of ['Export', 'Edit dashboard', 'Share', 'Download', 'PDF settings', 'View as table']) {
+            assert.equal(labels.file.test(label), false, label);
+            assert.equal(labels.pdf.test(label), false, label);
+        }
+    }
+
+    // --- iOS attachment downloads: the app asks the page to re-fetch the URL and send it over the export bridge
+    {
+        const sent: any[] = [];
+        const fetched: string[] = [];
+        const bridgeWindow: any = {
+            ...webWindow,
+            __ntInit: false,
+            HTMLAnchorElement: { prototype: { click() {} } },
+            URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} },
+            ReactNativeWebView: {
+                postMessage: (raw: string) => {
+                    const message = JSON.parse(raw);
+                    sent.push(message);
+                    // Acknowledge every sequenced message the way AnalyticsScreen does.
+                    if (message.sequence) setTimeout(() => bridgeWindow.__ntDownloadAck(message.id, message.sequence, true), 0);
+                },
+            },
+        };
+        const csv = new Blob(['a,b\n1,2\n'], { type: 'text/csv; charset=utf-8' });
+        vm.runInNewContext(script, {
+            document: { ...page, addEventListener() {} },
+            location: { origin: 'https://ss.example.org', pathname: '/superset/dashboard/5/', href: 'https://ss.example.org/superset/dashboard/5/' },
+            window: bridgeWindow, Event: class {}, URL, Blob, setTimeout, clearTimeout,
+            atob, history: undefined,
+            fetch: async (url: string) => { fetched.push(url); return { ok: true, blob: async () => csv, headers: { get: () => null } }; },
+            FileReader: class {
+                result: string | null = null; onload: null | (() => void) = null; onerror: null | (() => void) = null;
+                readAsDataURL(piece: Blob) { piece.arrayBuffer().then(buffer => { this.result = `data:;base64,${Buffer.from(buffer).toString('base64')}`; this.onload?.(); }); }
+            },
+        });
+        assert.equal(typeof bridgeWindow.__ntTransferExport, 'function');
+        assert.equal(bridgeWindow.__ntTransferExport('https://evil.org/steal.csv'), false, 'cross-origin downloads are refused');
+        assert.equal(bridgeWindow.__ntTransferExport('https://ss.example.org/api/v1/chart/7/data/?format=csv'), true);
+        for (let i = 0; i < 50 && !sent.some(m => m.type === 'export-finish' || m.type === 'export-abort'); i++) await new Promise(r => setTimeout(r, 5));
+        assert.deepEqual(fetched, ['https://ss.example.org/api/v1/chart/7/data/?format=csv']);
+        const start = sent.find(m => m.type === 'export-start');
+        assert.equal(start?.name, 'data.csv', 'a CSV without a file name gets a .csv extension');
+        assert.equal(start?.size, csv.size);
+        assert.ok(sent.some(m => m.type === 'export-finish'), JSON.stringify(sent));
+        assert.equal(Buffer.from(sent.find(m => m.type === 'export-chunk').data, 'base64').toString(), 'a,b\n1,2\n');
+        for (const message of sent) {
+            if (/^export-(start|chunk|finish)$/.test(message.type)) assert.ok(parseExportMessage(JSON.stringify(message)), `bridge message passes app validation: ${message.type}`);
+        }
+    }
+
+    // --- diagnostics: scrubbing, volume limits, endpoint validation
+    {
+        const scrubbed = scrubText('GET https://ss.example.org/superset/dashboard/5/?native_filters_key=abc&patient=Jane#x failed for jane.doe@clinic.org with nta_SECRETKEY123, Bearer abc.def, record 12345678');
+        assert.ok(scrubbed.includes('https://ss.example.org/superset/dashboard/5/'), scrubbed);
+        for (const leaked of ['native_filters_key', 'patient=Jane', 'jane.doe', 'nta_SECRET', 'abc.def', '12345678']) assert.ok(!scrubbed.includes(leaked), `${leaked} leaked: ${scrubbed}`);
+        assert.ok(scrubText('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl').includes('[token]'));
+        assert.ok(scrubText('x'.repeat(2000)).length <= 500);
+        assert.equal(scrubText('HTTP 502 from Webeditor'), 'HTTP 502 from Webeditor', 'short status numbers stay readable');
+
+        const queued: TelemetryEvent[] = [];
+        let clock = 1_000_000;
+        const reporter = createReporter({ app: { version: '1.0.1', build: '1', platform: 'android', os: '34' }, enqueue: e => queued.push(e), now: () => clock, maxPerSession: 3, dedupeWindowMs: 60_000 });
+        reporter.setCountry('ZW');
+        const first = reporter.report('page-error', new TypeError('Failed at https://ss.example.org/x?token=1'), { status: 502, url: 'https://ss.example.org/y?q=secret', 'bad key!': 'dropped' });
+        assert.ok(first);
+        assert.equal(first!.message, 'TypeError: Failed at https://ss.example.org/x');
+        assert.deepEqual(first!.detail, { status: 502, url: 'https://ss.example.org/y' });
+        assert.equal(first!.country, 'ZW');
+        assert.ok(first!.stack && !first!.stack.includes('token=1'));
+        assert.equal(reporter.report('page-error', new TypeError('Failed at https://ss.example.org/x?token=2')), null, 'same message within the window is deduplicated');
+        clock += 61_000;
+        assert.ok(reporter.report('page-error', new TypeError('Failed at https://ss.example.org/x')), 'reported again after the window');
+        assert.ok(reporter.report('config-error', 'Webeditor offline'));
+        assert.equal(reporter.report('crash', 'one too many'), null, 'per-session cap');
+        assert.equal(queued.length, 3);
+        assert.ok(queued.every(e => e.session === queued[0].session));
+
+        assert.equal(parseTelemetryUrl('https://we.example.org/api/v1/mobile-diagnostics', false), 'https://we.example.org/api/v1/mobile-diagnostics');
+        for (const bad of ['http://we.example.org/x', 'https://u:p@we.example.org/x', 'nope', '', undefined]) assert.equal(parseTelemetryUrl(bad, false), null, String(bad));
+        assert.equal(parseTelemetryUrl('http://10.0.2.2:3000/x', true), 'http://10.0.2.2:3000/x');
+    }
 
     console.log('neotree-reporting lib tests passed');
 }

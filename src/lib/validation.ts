@@ -3,10 +3,17 @@ import type { Country, RemoteConfig } from './types';
 export const MIN_TIMEOUT_MINUTES = 1;
 export const MAX_TIMEOUT_MINUTES = 1440;
 
-/** `host` matches exactly; `*.host` matches any subdomain (not the bare domain). */
-export function hostMatches(host: string, patterns: string[]) {
-    const h = host.toLowerCase();
-    return patterns.some(p => (p.startsWith('*.') ? h.endsWith(p.slice(1)) && h.length > p.length - 1 : h === p));
+/**
+ * `host` matches exactly; `*.host` matches any subdomain (not the bare domain). A pattern may end in
+ * `:port` to approve that port only; without one it approves the scheme's default port only.
+ */
+export function hostMatches(url: URL, patterns: string[]) {
+    const h = url.hostname.toLowerCase();
+    return patterns.some(pattern => {
+        const [p, port = ''] = pattern.split(':');
+        if (port !== url.port) return false;
+        return p.startsWith('*.') ? h.endsWith(p.slice(1)) && h.length > p.length - 1 : h === p;
+    });
 }
 
 type Opts = { allowInsecure: boolean; };
@@ -38,7 +45,8 @@ export function validateRemoteConfig(raw: unknown, country: Country, opts: Opts)
         return { ok: false, error: 'Superset URL must use HTTPS' };
     }
     if (url.username || url.password) return { ok: false, error: 'Superset URL must not contain credentials' };
-    if (country.allowedHosts.length && !hostMatches(url.hostname, country.allowedHosts)) {
+    // An empty allowlist approves nothing: the registry requires one, and this check never fails open.
+    if (!hostMatches(url, country.allowedHosts)) {
         return { ok: false, error: 'Superset host is not an approved host for this country' };
     }
 
@@ -82,9 +90,9 @@ export function isNavigationAllowed(url: string, supersetUrl: string, allowedHos
 
     if (target.protocol !== 'https:' && !(opts.allowInsecure && target.protocol === 'http:')) return false;
 
-    // A different port on the same hostname is a different web origin. Host patterns are limited
-    // to the default HTTPS port; a custom port is accepted only for the exact configured origin.
-    return target.origin === base.origin || (target.protocol === 'https:' && !target.port && hostMatches(target.hostname, allowedHosts));
+    // A different port on the same hostname is a different web origin: hostMatches approves a custom
+    // port only when an allowedHosts entry names it.
+    return target.origin === base.origin || (target.protocol === 'https:' && hostMatches(target, allowedHosts));
 }
 
 /** Hide authoring routes from this read-only WebView without showing a blocked-host warning. */

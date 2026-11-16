@@ -28,6 +28,20 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
     if (window.__ntInit) return;
     window.__ntInit = true;
 
+    // Superset menu labels the export bridge recognises. Checked against Superset 6.1.0 with the English UI.
+    // Superset has no stable ids for these items, so re-test exports after every Superset upgrade or
+    // language change (README: "Superset upgrade checklist") and adjust only these patterns.
+    var NT_LABELS = {
+      pdf: /^export (?:to|as) \.?pdf$/i,
+      image: /^download as (?:an )?image$/i,
+      // Any menu item that produces a file; shows "Preparing export…" until it arrives.
+      file: /^(?:export (?:to|as) \.?pdf|download as (?:an )?image|export screenshot.*|export yaml|export as examples?|(?:export|download).*(?:csv|excel|xlsx))$/i
+    };
+    // Menu text includes icon padding and line breaks; compare a single-spaced version.
+    var ntLabel = function (element) {
+      return String((element && element.textContent) || '').replace(/\s+/g, ' ').trim();
+    };
+
     function boot() {
 
     var path = location.pathname.replace(/\\/+$/, '').toLowerCase() || '/';
@@ -155,7 +169,10 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
             }
             var named = disposition && /filename\\*?=(?:UTF-8''|["']?)([^"';]+)/i.exec(disposition);
             if (named) { try { name = decodeURIComponent(named[1]); } catch (e) { name = named[1]; } }
-            var extension = blob.type === 'application/pdf' ? 'pdf' : blob.type.indexOf('image/') === 0 ? blob.type.split('/')[1] : 'bin';
+            var blobType = (blob.type || '').split(';')[0].toLowerCase();
+            var extension = blobType === 'application/pdf' ? 'pdf' : blobType.indexOf('image/') === 0 ? blobType.split('/')[1].replace('+xml', '')
+              : blobType === 'text/csv' ? 'csv' : blobType === 'application/zip' ? 'zip' : blobType === 'application/json' ? 'json'
+              : /spreadsheetml/.test(blobType) ? 'xlsx' : 'bin';
             if (!name) name = 'dashboard.' + extension;
             else if (!/\\.[A-Za-z0-9]{2,5}$/.test(name)) name += '.' + extension;
             if (convertToPdf && blob.type.indexOf('image/') === 0) name = name.replace(/\\.[^.]+$/, '') + '.pdf';
@@ -173,6 +190,19 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
             delete activeBlobUrls[href];
             if (deferredRevokes[href]) { delete deferredRevokes[href]; delete createdBlobs[href]; originalRevoke(href); }
           }
+        };
+        // iOS: WKWebView reports attachment responses (e.g. CSV) through onFileDownload with no file.
+        // The app calls this to fetch the same URL here, with the page's session, and save it through
+        // the export bridge. Only same-origin GET downloads can be repeated this way.
+        window.__ntTransferExport = function (url) {
+          try {
+            var target = new URL(String(url), location.href);
+            if (target.origin !== location.origin) return false;
+            var last = target.pathname.split('/').filter(Boolean).pop() || 'download';
+            try { last = decodeURIComponent(last); } catch (e) { /* keep the encoded segment */ }
+            transferExport(target.href, last);
+            return true;
+          } catch (e) { return false; }
         };
         var handleExportLink = function (anchor) {
           var href = anchor.href;
@@ -205,8 +235,8 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
           if (!captured && anchor.href && /(?:export|pdf|screenshot|image)/i.test(anchor.pathname || '')) {
             try {
               var target = new URL(anchor.href, location.href);
-              var label = (anchor.textContent || '').trim();
-              if (target.origin === location.origin && (preparingExport || /^(export (to|as) pdf|download as image)$/i.test(label))) {
+              var label = ntLabel(anchor);
+              if (target.origin === location.origin && (preparingExport || NT_LABELS.pdf.test(label) || NT_LABELS.image.test(label))) {
                 transferExport(target.href, anchor.download || (preparingExport && preparingExport.name) || label);
                 captured = true;
               }
@@ -220,11 +250,11 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
         document.addEventListener('click', function (event) {
           var item = event.target && event.target.closest && event.target.closest('[role="menuitem"], .ant-dropdown-menu-item');
           if (!item) return;
-          var label = (item.textContent || '').trim();
-          if (/^Export to PDF$/i.test(label) && /(^|\\/)superset\\/dashboard\\//.test(location.pathname)) {
+          var label = ntLabel(item);
+          if (NT_LABELS.pdf.test(label) && /(^|\\/)superset\\/dashboard\\//.test(location.pathname)) {
             var options = document.querySelectorAll('[role="menuitem"], .ant-dropdown-menu-item');
             for (var p = 0; p < options.length; p++) {
-              if (!/^Download as Image$/i.test((options[p].textContent || '').trim())) continue;
+              if (!NT_LABELS.image.test(ntLabel(options[p]))) continue;
               event.preventDefault();
               event.stopImmediatePropagation();
               pendingPdfId = 'export_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
@@ -235,7 +265,7 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
               return;
             }
           }
-          if (pendingPdf && /^Download as Image$/i.test(label)) {
+          if (pendingPdf && NT_LABELS.image.test(label)) {
             if (preparingExport) clearTimeout(preparingExport.timer);
             var pdfId = pendingPdfId;
             preparingExport = { timer: setTimeout(function () {
@@ -247,7 +277,7 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
             }, 90000) };
             return;
           }
-          if (!/^(export (to|as) pdf|download as image|export screenshot.*|export yaml|export as example|export.*csv|download.*csv|export.*excel)$/i.test(label)) return;
+          if (!NT_LABELS.file.test(label)) return;
           if (preparingExport) clearTimeout(preparingExport.timer);
           var id = 'export_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
           exportPost({ type: 'export-prepare', id: id, name: label });
@@ -445,9 +475,9 @@ export function buildInjectedScript(params: { landingPathname: string; supersetO
         var menuEntries = document.querySelectorAll('[data-test="header-actions-menu"] [role="menuitem"], .ant-dropdown-menu [role="menuitem"]');
         for (var m = 0; m < menuEntries.length; m++) {
           var entry = menuEntries[m];
-          var entryLabel = (entry.textContent || '').trim();
+          var entryLabel = ntLabel(entry);
           if (/^(?:Export YAML|Export as example|Export as examples|Examples|YAML)$/i.test(entryLabel)) hide(entry.closest('li') || entry);
-          if (/^(?:Export to PDF|Download as Image)$/i.test(entryLabel)) {
+          if (NT_LABELS.pdf.test(entryLabel) || NT_LABELS.image.test(entryLabel)) {
             var downloadMenu = entry.closest('ul, [role="menu"]');
             if (downloadMenu) downloadMenu.classList.add('nt-download-menu');
           }

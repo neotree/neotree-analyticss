@@ -7,7 +7,9 @@
             "flag": "assets/flags/zw.png",
             "webeditorUrl": "https://webeditor.zw.example.org",
             "apiKey": "nta_REPLACE_WITH_KEY_FROM_REPORTING_CONFIGURATIONS_PAGE",
-            "allowedHosts": []
+            "allowedHosts": [
+                "analytics.zw.example.org"
+            ]
         },
         {
             "code": "MW",
